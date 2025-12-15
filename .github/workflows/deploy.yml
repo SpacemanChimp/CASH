@@ -1,0 +1,55 @@
+name: Build & Deploy EVE Money Button (Dev)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas sqlite-utils tqdm
+
+      - name: Build / update rankings
+        run: |
+          python scripts/update_rankings.py \
+            --price-mode minmax \
+            --fee-rate 0.015 \
+            --reprocess-yield 0.82
+
+      - name: Commit updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/data/*.json
+          git commit -m "Update EVE money button rankings" || echo "No changes"
+          git push
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
