@@ -9,6 +9,7 @@ const state = {
 function fmtISK(x) {
   if (x === null || x === undefined || Number.isNaN(x)) return "—";
   const n = Number(x);
+  if (!Number.isFinite(n)) return "—";
   const abs = Math.abs(n);
   const sign = n < 0 ? "-" : "";
   const suffixes = [
@@ -25,19 +26,24 @@ function fmtISK(x) {
 
 function fmtPct(x) {
   if (x === null || x === undefined || Number.isNaN(x)) return "—";
-  return `${(Number(x) * 100).toFixed(1)}%`;
+  const n = Number(x);
+  if (!Number.isFinite(n)) return "—";
+  return `${(n * 100).toFixed(1)}%`;
 }
 
 function fmtM3(x) {
   if (x === null || x === undefined || Number.isNaN(x)) return "—";
   const n = Number(x);
+  if (!Number.isFinite(n)) return "—";
   if (n >= 1000) return `${(n/1000).toFixed(2)}k m³`;
   return `${n.toFixed(2)} m³`;
 }
 
 function fmtDuration(seconds) {
-  if (!seconds || Number.isNaN(seconds)) return "—";
-  const s = Math.max(0, Math.floor(seconds));
+  if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "—";
+  const s0 = Number(seconds);
+  if (!Number.isFinite(s0)) return "—";
+  const s = Math.max(0, Math.floor(s0));
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   if (h > 0) return `${h}h ${m}m`;
@@ -49,17 +55,42 @@ function setStatus(msg) {
   el.textContent = msg;
 }
 
-function sortByField(rows, field) {
+// Sorting: most fields are "bigger is better" (desc).
+// Payback (runs) is the opposite: smaller is better (asc), missing values go last.
+function sortRows(rows, field) {
   const copy = [...rows];
+
+  // Special-case payback: ascending, null/NaN => Infinity
+  if (field === "payback_runs") {
+    copy.sort((a, b) => {
+      const avRaw = a[field];
+      const bvRaw = b[field];
+      const av = Number.isFinite(Number(avRaw)) ? Number(avRaw) : Number.POSITIVE_INFINITY;
+      const bv = Number.isFinite(Number(bvRaw)) ? Number(bvRaw) : Number.POSITIVE_INFINITY;
+      if (av !== bv) return av - bv; // asc
+      // tie-breaker: higher ISK/hour wins
+      const ap = Number(a.profit_per_hour || 0);
+      const bp = Number(b.profit_per_hour || 0);
+      return bp - ap;
+    });
+    return copy;
+  }
+
+  // Default: numeric desc; null/NaN last
   copy.sort((a, b) => {
-    const av = a[field];
-    const bv = b[field];
-    // nulls last
-    if (av === null || av === undefined) return 1;
-    if (bv === null || bv === undefined) return -1;
-    // numeric desc
-    return (Number(bv) - Number(av));
+    const av = Number(a[field]);
+    const bv = Number(b[field]);
+
+    const aOk = Number.isFinite(av);
+    const bOk = Number.isFinite(bv);
+
+    if (!aOk && !bOk) return 0;
+    if (!aOk) return 1;
+    if (!bOk) return -1;
+
+    return bv - av;
   });
+
   return copy;
 }
 
@@ -149,7 +180,7 @@ function renderAll() {
 
   // Manufacturing
   const mfgSort = document.getElementById("mfgSort").value;
-  const mfgRows = sortByField(data.manufacturing || [], mfgSort);
+  const mfgRows = sortRows(data.manufacturing || [], mfgSort);
 
   renderTable("mfgTable", mfgRows, [
     { title: "Build (Product)", render: (r) => `<div><strong>${r.product_name}</strong></div><div class="small">${r.blueprint_name}</div>` },
@@ -159,12 +190,12 @@ function renderAll() {
     { title: "Time", render: (r) => `${fmtDuration(r.time_s)}` },
     { title: "Cost", render: (r) => `${fmtISK(r.cost)}` },
     { title: "BPO cost", render: (r) => `${fmtISK(r.blueprint_cost)}` },
-    { title: "Payback (runs)", render: (r) => `${r.payback_runs ? r.payback_runs.toFixed(1) : "—"}` },
+    { title: "Payback (runs)", render: (r) => `${Number.isFinite(Number(r.payback_runs)) ? Number(r.payback_runs).toFixed(1) : "—"}` },
   ], renderMaterialsDetails);
 
   // Reactions
   const rxSort = document.getElementById("rxSort").value;
-  const rxRows = sortByField(data.reactions || [], rxSort);
+  const rxRows = sortRows(data.reactions || [], rxSort);
 
   renderTable("rxTable", rxRows, [
     { title: "Reaction (Output)", render: (r) => `<div><strong>${r.product_name}</strong></div><div class="small">${r.blueprint_name}</div>` },
@@ -178,7 +209,7 @@ function renderAll() {
 
   // Refining
   const refSort = document.getElementById("refSort").value;
-  const refRows = sortByField(data.refining || [], refSort);
+  const refRows = sortRows(data.refining || [], refSort);
 
   renderTable("refTable", refRows, [
     { title: "Reprocess this", render: (r) => `<div><strong>${r.input_name}</strong></div><div class="small">Batch: ${r.batch_units} units (${fmtM3(r.batch_m3)})</div>` },
