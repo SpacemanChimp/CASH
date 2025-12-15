@@ -65,8 +65,10 @@ function sortRows(rows, field) {
     copy.sort((a, b) => {
       const avRaw = a[field];
       const bvRaw = b[field];
-      const av = Number.isFinite(Number(avRaw)) ? Number(avRaw) : Number.POSITIVE_INFINITY;
-      const bv = Number.isFinite(Number(bvRaw)) ? Number(bvRaw) : Number.POSITIVE_INFINITY;
+      const avNum = (avRaw === null || avRaw === undefined) ? Number.POSITIVE_INFINITY : Number(avRaw);
+      const bvNum = (bvRaw === null || bvRaw === undefined) ? Number.POSITIVE_INFINITY : Number(bvRaw);
+      const av = Number.isFinite(avNum) ? avNum : Number.POSITIVE_INFINITY;
+      const bv = Number.isFinite(bvNum) ? bvNum : Number.POSITIVE_INFINITY;
       if (av !== bv) return av - bv; // asc
       // tie-breaker: higher ISK/hour wins
       const ap = Number(a.profit_per_hour || 0);
@@ -176,7 +178,7 @@ function renderAll() {
 
   const gen = data.generated_at ? new Date(data.generated_at).toISOString() : "unknown";
   const market = data.market || {};
-  setStatus(`Loaded. Generated: ${gen} | Region: ${market.region_id ?? "?"} | Station: ${market.station_id ?? "?"} | Price mode: ${data.assumptions?.price_mode ?? "?"}`);
+  setStatus(`Loaded. Generated: ${gen} | Region: ${market.region_id ?? "?"} | Station: ${market.station_id ?? "—"} | Scope: ${market.pricing_scope ?? "?"} | Price mode: ${data.assumptions?.price_mode ?? "?"}`);
 
   // Manufacturing
   const mfgSort = document.getElementById("mfgSort").value;
@@ -190,7 +192,7 @@ function renderAll() {
     { title: "Time", render: (r) => `${fmtDuration(r.time_s)}` },
     { title: "Cost", render: (r) => `${fmtISK(r.cost)}` },
     { title: "BPO cost", render: (r) => `${fmtISK(r.blueprint_cost)}` },
-    { title: "Payback (runs)", render: (r) => `${Number.isFinite(Number(r.payback_runs)) ? Number(r.payback_runs).toFixed(1) : "—"}` },
+    { title: "Payback (runs)", render: (r) => `${(r.payback_runs === null || r.payback_runs === undefined || !Number.isFinite(Number(r.payback_runs))) ? "—" : Number(r.payback_runs).toFixed(1)}` },
   ], renderMaterialsDetails);
 
   // Reactions

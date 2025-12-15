@@ -614,6 +614,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--region-id", type=int, default=DEFAULT_REGION_ID)
     ap.add_argument("--station-id", type=int, default=DEFAULT_STATION_ID)
+    ap.add_argument("--pricing-scope", choices=["region","station"], default="region", help="Use region aggregates (recommended) or station-level aggregates for a specific station (very strict).")
     ap.add_argument("--price-mode", choices=["minmax", "percentile", "weighted"], default="minmax")
     ap.add_argument("--fee-rate", type=float, default=0.015, help="Approx. sales tax + broker fee on output revenue (e.g. 0.015 = 1.5%).")
     ap.add_argument("--reprocess-yield", type=float, default=0.82)
@@ -686,9 +687,14 @@ def main() -> int:
     type_ids |= gather_type_ids_from_industry_rows(rx_short)
     type_ids |= gather_type_ids_from_ref_rows(ref_short)
 
-    type_id_list = sorted(type_ids)
-    print(f"[update_rankings] Station refresh for {len(type_id_list)} unique typeIDs…")
-    station_prices = fetch_station_aggregates(args.station_id, type_id_list)
+    if args.pricing_scope == "station":
+        type_id_list = sorted(type_ids)
+        print(f"[update_rankings] Station refresh for {len(type_id_list)} unique typeIDs…")
+        station_prices = fetch_station_aggregates(args.station_id, type_id_list)
+    else:
+        # Region scope: treat region aggregates as the "Jita/The Forge" market view.
+        # This avoids empty results for items that are commonly traded in other structures (e.g. Perimeter) instead of a specific station.
+        station_prices = region_prices
 
     # 2) Recompute final using station prices ONLY (if a type isn't in station_prices, we treat it as unavailable in Jita 4-4)
     def compute_blueprint_cost_and_payback(row: Dict[str, Any]) -> None:
@@ -797,7 +803,7 @@ def main() -> int:
 
     out = {
         "generated_at": utc_now_iso(),
-        "market": {"region_id": args.region_id, "station_id": args.station_id},
+        "market": {"region_id": args.region_id, "station_id": (args.station_id if args.pricing_scope == "station" else None), "pricing_scope": args.pricing_scope},
         "assumptions": {
             "price_mode": args.price_mode,
             "fee_rate": args.fee_rate,
