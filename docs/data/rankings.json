@@ -1,0 +1,15 @@
+{
+  "generated_at": null,
+  "market": {
+    "region_id": 10000002,
+    "station_id": 60003760
+  },
+  "assumptions": {
+    "price_mode": "percentile",
+    "fees_rate": 0.03,
+    "reprocess_yield": 0.7
+  },
+  "manufacturing": [],
+  "reactions": [],
+  "refining": []
+}
