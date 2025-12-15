@@ -4,6 +4,14 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "0 */6 * * *"
+  push:
+    branches: [ main ]
+    paths:
+      - "scripts/**"
+      - "docs/**"
+      - "data/**"
+      - ".github/workflows/**"
+
 
 permissions:
   contents: write
