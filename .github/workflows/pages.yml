@@ -1,0 +1,76 @@
+name: Build and Deploy (EVE Money Button)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "scripts/**"
+      - "docs/**"
+      - "data/**"
+      - ".github/workflows/**"
+      - "requirements.txt"
+  schedule:
+    - cron: "0 */6 * * *"  # every 6 hours
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Optional: cache the SDE + fuzzwork downloads to speed up runs
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: ${{ runner.os }}-eve-cache-v1
+          restore-keys: |
+            ${{ runner.os }}-eve-cache-
+
+      - name: Build daily rankings (writes docs/data/rankings.json)
+        run: |
+          python scripts/update_rankings.py \
+            --pricing-scope region \
+            --price-mode minmax \
+            --fee-rate 0.015 \
+            --reprocess-yield 0.82
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
