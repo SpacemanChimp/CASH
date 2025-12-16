@@ -36,10 +36,14 @@ jobs:
       - name: Update rankings
         run: |
           python scripts/update_rankings.py \
-          --pricing-scope region \
-          --price-mode minmax \
-          --fee-rate 0.015 \
-          --reprocess-yield 0.82
+            --pricing-scope region \
+            --price-mode minmax \
+            --fee-rate 0.015 \
+            --reprocess-yield 0.82 \
+            --min-bpo-sell-orders 1 \
+            --min-output-buy-orders 1 \
+            --limit-mfg 60 --limit-rx 60 --limit-ref 60
+
 
 
 
