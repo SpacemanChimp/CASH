@@ -8,6 +8,10 @@ covering:
   - reactions      (industry activityID = 11)
   - refining / reprocessing (invTypeMaterials, ore/ice-like items)
 
+This version auto-detects column names in the SQLite, because Fuzzwork's eve.db
+schema occasionally differs from the canonical SDE names (e.g. blueprintTypeID
+sometimes appears as typeID).
+
 Output schema (what update_rankings.py expects):
 {
   "generated_at": "...",
@@ -36,11 +40,6 @@ Output schema (what update_rankings.py expects):
      }, ...
   ]
 }
-
-Notes:
-- This is "static recipe" data. Profitability comes from update_rankings.py using market prices.
-- The filtering for "ore/ice-like" inputs is heuristic, based on group/category names containing
-  "asteroid", "ore", or "ice". If CCP renames categories, you can loosen/tighten the filter below.
 """
 
 from __future__ import annotations
@@ -49,9 +48,7 @@ import argparse
 import bz2
 import gzip
 import json
-import os
 import sqlite3
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -95,7 +92,6 @@ def ensure_eve_db(force: bool = False) -> None:
 
     if force or not EVE_DB_PATH.exists():
         print("[build_recipes] Decompressing eve.db.bz2 → eve.db")
-        # Decompress (bz2) to a sqlite file
         with bz2.open(EVE_DB_BZ2_PATH, "rb") as src, open(EVE_DB_PATH, "wb") as dst:
             while True:
                 chunk = src.read(1024 * 1024)
@@ -104,26 +100,47 @@ def ensure_eve_db(force: bool = False) -> None:
                 dst.write(chunk)
 
 
+def table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    cols: List[str] = []
+    for r in rows:
+        # sqlite3.Row supports both index and key access
+        name = r["name"] if isinstance(r, sqlite3.Row) else r[1]
+        cols.append(str(name))
+    return cols
+
+
+def pick_col(conn: sqlite3.Connection, table: str, candidates: List[str]) -> str:
+    cols = table_columns(conn, table)
+    lower_map = {c.lower(): c for c in cols}
+    for cand in candidates:
+        c = lower_map.get(cand.lower())
+        if c:
+            return c
+    raise RuntimeError(f"[build_recipes] Could not find expected column in table={table}. Have columns: {cols}")
+
+
 def load_types(conn: sqlite3.Connection) -> Dict[int, Dict[str, Any]]:
     """
     Returns mapping typeID -> {name, volume, portionSize}
     """
+    t_typeid = pick_col(conn, "invTypes", ["typeID"])
+    t_typename = pick_col(conn, "invTypes", ["typeName", "typeNAME", "name"])
+    t_volume = pick_col(conn, "invTypes", ["volume"])
+    t_portion = pick_col(conn, "invTypes", ["portionSize", "portion"])
+    t_published = pick_col(conn, "invTypes", ["published"])
+
     types: Dict[int, Dict[str, Any]] = {}
-    # invTypes columns are stable: typeID, typeName, volume, portionSize, published
     cur = conn.execute(
-        "SELECT typeID, typeName, COALESCE(volume, 0), COALESCE(portionSize, 1) "
-        "FROM invTypes "
-        "WHERE COALESCE(published, 1) = 1"
+        f"SELECT {t_typeid} as typeID, {t_typename} as typeName, COALESCE({t_volume}, 0) as volume, COALESCE({t_portion}, 1) as portionSize "
+        f"FROM invTypes WHERE COALESCE({t_published}, 1) = 1"
     )
-    for type_id, name, vol, portion in cur.fetchall():
-        try:
-            tid = int(type_id)
-        except Exception:
-            continue
+    for row in cur.fetchall():
+        tid = int(row["typeID"])
         types[tid] = {
-            "name": str(name),
-            "volume": float(vol) if vol is not None else 0.0,
-            "portionSize": int(portion) if portion is not None else 1,
+            "name": str(row["typeName"]),
+            "volume": float(row["volume"]) if row["volume"] is not None else 0.0,
+            "portionSize": int(row["portionSize"]) if row["portionSize"] is not None else 1,
         }
     return types
 
@@ -131,40 +148,56 @@ def load_types(conn: sqlite3.Connection) -> Dict[int, Dict[str, Any]]:
 def build_industry_recipes(conn: sqlite3.Connection, types: Dict[int, Dict[str, Any]], activity_id: int) -> List[Dict[str, Any]]:
     """
     Builds manufacturing or reaction recipes based on industryActivity* tables.
+    Auto-detects column names (blueprintTypeID sometimes appears as typeID).
     """
-    # Pull activity rows with products in one go
+    ia_bp = pick_col(conn, "industryActivity", ["blueprintTypeID", "typeID"])
+    ia_act = pick_col(conn, "industryActivity", ["activityID"])
+    ia_time = pick_col(conn, "industryActivity", ["time", "duration"])
+
+    iap_bp = pick_col(conn, "industryActivityProducts", ["blueprintTypeID", "typeID"])
+    iap_act = pick_col(conn, "industryActivityProducts", ["activityID"])
+    iap_prod = pick_col(conn, "industryActivityProducts", ["productTypeID"])
+    iap_qty = pick_col(conn, "industryActivityProducts", ["quantity", "qty"])
+
+    iam_bp = pick_col(conn, "industryActivityMaterials", ["blueprintTypeID", "typeID"])
+    iam_act = pick_col(conn, "industryActivityMaterials", ["activityID"])
+    iam_mat = pick_col(conn, "industryActivityMaterials", ["materialTypeID"])
+    iam_qty = pick_col(conn, "industryActivityMaterials", ["quantity", "qty"])
+
     cur = conn.execute(
-        "SELECT ia.blueprintTypeID, ia.time, p.productTypeID, p.quantity "
-        "FROM industryActivity ia "
-        "JOIN industryActivityProducts p "
-        "  ON ia.blueprintTypeID = p.blueprintTypeID AND ia.activityID = p.activityID "
-        "WHERE ia.activityID = ?",
+        f"SELECT ia.{ia_bp} AS bp, ia.{ia_time} AS time_s, p.{iap_prod} AS prod, p.{iap_qty} AS qty "
+        f"FROM industryActivity ia "
+        f"JOIN industryActivityProducts p "
+        f"  ON ia.{ia_bp} = p.{iap_bp} AND ia.{ia_act} = p.{iap_act} "
+        f"WHERE ia.{ia_act} = ?",
         (activity_id,),
     )
 
-    # Choose the primary product per blueprint: highest quantity
-    best_product: Dict[Tuple[int, int], Tuple[int, float]] = {}  # (bp, activity) -> (prod, qty)
-    time_s: Dict[Tuple[int, int], int] = {}
+    best_product: Dict[int, Tuple[int, float]] = {}  # bp -> (prod, qty)
+    time_s: Dict[int, int] = {}  # bp -> time
 
-    for bp_id, t, prod_id, qty in cur.fetchall():
-        key = (int(bp_id), activity_id)
-        time_s[key] = int(t) if t is not None else 0
-        prod = int(prod_id)
-        q = float(qty) if qty is not None else 1.0
-        prev = best_product.get(key)
-        if prev is None or q > prev[1]:
-            best_product[key] = (prod, q)
+    for row in cur.fetchall():
+        bp = int(row["bp"])
+        t = int(row["time_s"]) if row["time_s"] is not None else 0
+        prod = int(row["prod"])
+        qty = float(row["qty"]) if row["qty"] is not None else 1.0
 
-    # Materials lookup prepared statement
-    mats_stmt = "SELECT materialTypeID, quantity FROM industryActivityMaterials WHERE blueprintTypeID = ? AND activityID = ?"
+        time_s[bp] = t
+        prev = best_product.get(bp)
+        if prev is None or qty > prev[1]:
+            best_product[bp] = (prod, qty)
+
+    mats_stmt = (
+        f"SELECT {iam_mat} AS mat, {iam_qty} AS qty "
+        f"FROM industryActivityMaterials WHERE {iam_bp} = ? AND {iam_act} = ?"
+    )
 
     out: List[Dict[str, Any]] = []
-    for (bp, act), (prod, out_qty) in best_product.items():
-        # Materials
+    for bp, (prod, out_qty) in best_product.items():
         mats: List[Dict[str, Any]] = []
-        for mtid, mqty in conn.execute(mats_stmt, (bp, act)).fetchall():
-            mt = int(mtid)
-            q = float(mqty) if mqty is not None else 0.0
+        for mrow in conn.execute(mats_stmt, (bp, activity_id)).fetchall():
+            mt = int(mrow["mat"])
+            q = float(mrow["qty"]) if mrow["qty"] is not None else 0.0
             if q <= 0:
                 continue
             mats.append({"type_id": mt, "name": types.get(mt, {}).get("name", f"type {mt}"), "qty": q})
@@ -174,6 +207,7 @@ def build_industry_recipes(conn: sqlite3.Connection, types: Dict[int, Dict[str, 
 
         bp_name = types.get(bp, {}).get("name", f"type {bp}")
         prod_name = types.get(prod, {}).get("name", f"type {prod}")
+
         out.append(
             {
                 "blueprint_type_id": bp,
@@ -181,7 +215,7 @@ def build_industry_recipes(conn: sqlite3.Connection, types: Dict[int, Dict[str, 
                 "product_type_id": prod,
                 "product_name": prod_name,
                 "output_qty": float(out_qty) if out_qty and out_qty > 0 else 1.0,
-                "time_s": int(time_s.get((bp, act), 0)),
+                "time_s": int(time_s.get(bp, 0)),
                 "materials": mats,
             }
         )
@@ -191,47 +225,72 @@ def build_industry_recipes(conn: sqlite3.Connection, types: Dict[int, Dict[str, 
 
 def build_refining_recipes(conn: sqlite3.Connection, types: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Builds reprocessing recipes from invTypeMaterials.
-    Attempts to restrict to ore/ice-like items by group/category names.
+    Builds reprocessing recipes from invTypeMaterials for ore/ice-like items.
     """
-    # Heuristic selection of candidate inputs with reprocessing yields.
-    # We join invGroups + invCategories to look at names.
+    t_typeid = pick_col(conn, "invTypes", ["typeID"])
+    t_typename = pick_col(conn, "invTypes", ["typeName", "name"])
+    t_volume = pick_col(conn, "invTypes", ["volume"])
+    t_portion = pick_col(conn, "invTypes", ["portionSize", "portion"])
+    t_groupid = pick_col(conn, "invTypes", ["groupID"])
+    t_published = pick_col(conn, "invTypes", ["published"])
+
+    g_groupid = pick_col(conn, "invGroups", ["groupID"])
+    g_groupname = pick_col(conn, "invGroups", ["groupName", "name"])
+    g_catid = pick_col(conn, "invGroups", ["categoryID"])
+
+    c_catid = pick_col(conn, "invCategories", ["categoryID"])
+    c_catname = pick_col(conn, "invCategories", ["categoryName", "name"])
+
+    itm_typeid = pick_col(conn, "invTypeMaterials", ["typeID"])
+    itm_mat = pick_col(conn, "invTypeMaterials", ["materialTypeID"])
+    itm_qty = pick_col(conn, "invTypeMaterials", ["quantity", "qty"])
+
     cur = conn.execute(
-        "SELECT t.typeID, t.typeName, COALESCE(t.volume, 0), COALESCE(t.portionSize, 1), "
-        "       COALESCE(g.groupName, ''), COALESCE(c.categoryName, '') "
-        "FROM invTypes t "
-        "JOIN invGroups g ON t.groupID = g.groupID "
-        "JOIN invCategories c ON g.categoryID = c.categoryID "
-        "WHERE COALESCE(t.published, 1) = 1 "
-        "  AND t.typeID IN (SELECT DISTINCT typeID FROM invTypeMaterials)"
+        f"SELECT t.{t_typeid} AS typeID, t.{t_typename} AS typeName, COALESCE(t.{t_volume}, 0) AS volume, "
+        f"       COALESCE(t.{t_portion}, 1) AS portionSize, "
+        f"       COALESCE(g.{g_groupname}, '') AS groupName, COALESCE(c.{c_catname}, '') AS categoryName "
+        f"FROM invTypes t "
+        f"JOIN invGroups g ON t.{t_groupid} = g.{g_groupid} "
+        f"JOIN invCategories c ON g.{g_catid} = c.{c_catid} "
+        f"WHERE COALESCE(t.{t_published}, 1) = 1 "
+        f"  AND t.{t_typeid} IN (SELECT DISTINCT {itm_typeid} FROM invTypeMaterials)"
     )
 
     def looks_like_ore_or_ice(group_name: str, cat_name: str, type_name: str) -> bool:
         s = f"{group_name} {cat_name} {type_name}".lower()
-        return ("asteroid" in s) or (" ore" in s) or s.endswith("ore") or ("ice" in s)
+        # Broad-ish. We want ore & ice, not "everything that can be reprocessed".
+        if "asteroid" in s:
+            return True
+        if "ice" in s:
+            return True
+        if "ore" in s:
+            return True
+        return False
 
     candidates: List[Tuple[int, str, float, int]] = []
-    for tid, tname, vol, portion, gname, cname in cur.fetchall():
-        tid = int(tid)
-        tname = str(tname)
-        gname = str(gname)
-        cname = str(cname)
+    for row in cur.fetchall():
+        tid = int(row["typeID"])
+        tname = str(row["typeName"])
+        vol = float(row["volume"]) if row["volume"] is not None else 0.0
+        portion = int(row["portionSize"]) if row["portionSize"] is not None else 1
+        gname = str(row["groupName"])
+        cname = str(row["categoryName"])
+
         if not looks_like_ore_or_ice(gname, cname, tname):
             continue
-        portion_i = int(portion) if portion is not None else 1
-        if portion_i <= 0:
-            portion_i = 1
-        vol_f = float(vol) if vol is not None else 0.0
-        candidates.append((tid, tname, vol_f, portion_i))
+        if portion <= 0:
+            portion = 1
 
-    # Now build outputs for each candidate
+        candidates.append((tid, tname, vol, portion))
+
+    stmt = f"SELECT {itm_mat} AS mat, {itm_qty} AS qty FROM invTypeMaterials WHERE {itm_typeid} = ?"
+
     out: List[Dict[str, Any]] = []
-    stmt = "SELECT materialTypeID, quantity FROM invTypeMaterials WHERE typeID = ?"
     for tid, tname, vol, portion in candidates:
         outs: List[Dict[str, Any]] = []
-        for mtid, qty in conn.execute(stmt, (tid,)).fetchall():
-            mt = int(mtid)
-            q = float(qty) if qty is not None else 0.0
+        for mrow in conn.execute(stmt, (tid,)).fetchall():
+            mt = int(mrow["mat"])
+            q = float(mrow["qty"]) if mrow["qty"] is not None else 0.0
             if q <= 0:
                 continue
             outs.append({"type_id": mt, "name": types.get(mt, {}).get("name", f"type {mt}"), "qty": q})
@@ -239,15 +298,15 @@ def build_refining_recipes(conn: sqlite3.Connection, types: Dict[int, Dict[str, 
         if not outs:
             continue
 
-        batch_units = portion
+        batch_units = int(portion)
         batch_m3 = float(batch_units) * float(vol)
 
         out.append(
             {
                 "input_type_id": tid,
                 "input_name": tname,
-                "batch_units": int(batch_units),
-                "batch_m3": float(batch_m3),
+                "batch_units": batch_units,
+                "batch_m3": batch_m3,
                 "outputs": outs,
             }
         )
