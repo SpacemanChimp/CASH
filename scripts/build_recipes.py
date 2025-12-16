@@ -2,11 +2,45 @@
 """
 build_recipes.py
 
-Builds a compact recipes file from the EVE SDE (via Fuzzwork's SQLite conversion),
-so that routine price updates don't need to re-download the entire SDE.
+Builds a compact recipes JSON (gzipped) from the EVE SDE SQLite (Fuzzwork eve.db),
+covering:
+  - manufacturing (industry activityID = 1)
+  - reactions      (industry activityID = 11)
+  - refining / reprocessing (invTypeMaterials, ore/ice-like items)
 
-Sources:
-- Fuzzwork SDE SQLite conversion is published at https://www.fuzzwork.co.uk/dump/latest/eve.db.bz2 (see EVE forums post by Steve Ronuken).
+Output schema (what update_rankings.py expects):
+{
+  "generated_at": "...",
+  "types": {
+     "<type_id>": {"name": "...", "volume": 0.0, "portionSize": 1}
+  },
+  "manufacturing": [
+     {
+       "blueprint_type_id": 123,
+       "blueprint_name": "Some Blueprint",
+       "product_type_id": 456,
+       "product_name": "Some Item",
+       "output_qty": 1,
+       "time_s": 600,
+       "materials": [{"type_id": 34, "name": "Tritanium", "qty": 1000}, ...]
+     }, ...
+  ],
+  "reactions": [ ... same shape ... ],
+  "refining": [
+     {
+       "input_type_id": 1230,
+       "input_name": "Veldspar",
+       "batch_units": 333,
+       "batch_m3": 33.3,
+       "outputs": [{"type_id": 34, "name": "Tritanium", "qty": 1000}, ...]
+     }, ...
+  ]
+}
+
+Notes:
+- This is "static recipe" data. Profitability comes from update_rankings.py using market prices.
+- The filtering for "ore/ice-like" inputs is heuristic, based on group/category names containing
+  "asteroid", "ore", or "ice". If CCP renames categories, you can loosen/tighten the filter below.
 """
 
 from __future__ import annotations
@@ -15,26 +49,32 @@ import argparse
 import bz2
 import gzip
 import json
+import os
 import sqlite3
-from dataclasses import dataclass
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import requests
 
-FUZZWORK_SDE_SQLITE_BZ2 = "https://www.fuzzwork.co.uk/dump/latest/eve.db.bz2"
+EVE_DB_BZ2_URL = "https://www.fuzzwork.co.uk/dump/latest/eve.db.bz2"
+CACHE_DIR = Path(".cache")
+EVE_DB_BZ2_PATH = CACHE_DIR / "eve.db.bz2"
+EVE_DB_PATH = CACHE_DIR / "eve.db"
 
-ACTIVITY_MANUFACTURING = 1
-ACTIVITY_REACTIONS = 11
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _ensure_parent(p: Path) -> None:
+def ensure_parent(p: Path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
 
 
-def download(url: str, dest: Path, timeout: int = 60) -> None:
-    _ensure_parent(dest)
-    with requests.get(url, stream=True, timeout=timeout) as r:
+def download(url: str, dest: Path, timeout: int = 180) -> None:
+    ensure_parent(dest)
+    with requests.get(url, stream=True, timeout=timeout, headers={"User-Agent": "eve-money-button/1.0"}) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -42,235 +82,224 @@ def download(url: str, dest: Path, timeout: int = 60) -> None:
                     f.write(chunk)
 
 
-def decompress_bz2(src: Path, dest: Path) -> None:
-    _ensure_parent(dest)
-    with bz2.open(src, "rb") as fin, open(dest, "wb") as fout:
-        while True:
-            b = fin.read(1024 * 1024)
-            if not b:
-                break
-            fout.write(b)
+def ensure_eve_db(force: bool = False) -> None:
+    """
+    Ensures .cache/eve.db exists (decompressed).
+    Downloads eve.db.bz2 if needed.
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if force or not EVE_DB_BZ2_PATH.exists():
+        print(f"[build_recipes] Downloading {EVE_DB_BZ2_URL}")
+        download(EVE_DB_BZ2_URL, EVE_DB_BZ2_PATH)
+
+    if force or not EVE_DB_PATH.exists():
+        print("[build_recipes] Decompressing eve.db.bz2 → eve.db")
+        # Decompress (bz2) to a sqlite file
+        with bz2.open(EVE_DB_BZ2_PATH, "rb") as src, open(EVE_DB_PATH, "wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
 
 
-def table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
-    rows = conn.execute(f"PRAGMA table_info({table});").fetchall()
-    return [r[1] for r in rows]  # name column
-
-
-def has_table(conn: sqlite3.Connection, table: str) -> bool:
-    r = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?;",
-        (table,),
-    ).fetchone()
-    return r is not None
-
-
-def pick_col(cols: List[str], *candidates: str) -> str:
-    for c in candidates:
-        if c in cols:
-            return c
-    raise KeyError(f"None of {candidates} found in columns={cols}")
-
-
-def build_recipes(db_path: Path) -> Dict[str, Any]:
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-
-    # Basic sanity checks
-    for t in ["invTypes", "industryActivityMaterials", "industryActivityProducts", "invTypeMaterials"]:
-        if not has_table(conn, t):
-            raise RuntimeError(f"Expected table '{t}' not found in {db_path}")
-
-    inv_cols = table_columns(conn, "invTypes")
-    c_type_id = pick_col(inv_cols, "typeID")
-    c_type_name = pick_col(inv_cols, "typeName")
-    c_volume = pick_col(inv_cols, "volume")
-    c_portion = pick_col(inv_cols, "portionSize")
-    c_published = pick_col(inv_cols, "published")
-    # marketGroupID is useful for filtering, but not always present in older conversions.
-    c_mktgrp = "marketGroupID" if "marketGroupID" in inv_cols else None
-
-    # Pull all type names/volumes we might reference.
-    # (We avoid loading *everything* into RAM if possible, but in practice this is fine.)
-    type_rows = conn.execute(
-        f"SELECT {c_type_id} AS type_id, {c_type_name} AS type_name, {c_volume} AS volume, {c_portion} AS portion, {c_published} AS published"
-        + (f", {c_mktgrp} AS market_group" if c_mktgrp else "")
-        + " FROM invTypes;"
-    ).fetchall()
-
+def load_types(conn: sqlite3.Connection) -> Dict[int, Dict[str, Any]]:
+    """
+    Returns mapping typeID -> {name, volume, portionSize}
+    """
     types: Dict[int, Dict[str, Any]] = {}
-    for r in type_rows:
-        tid = int(r["type_id"])
+    # invTypes columns are stable: typeID, typeName, volume, portionSize, published
+    cur = conn.execute(
+        "SELECT typeID, typeName, COALESCE(volume, 0), COALESCE(portionSize, 1) "
+        "FROM invTypes "
+        "WHERE COALESCE(published, 1) = 1"
+    )
+    for type_id, name, vol, portion in cur.fetchall():
+        try:
+            tid = int(type_id)
+        except Exception:
+            continue
         types[tid] = {
-            "name": r["type_name"],
-            "volume": float(r["volume"] or 0.0),
-            "portion": int(r["portion"] or 1),
-            "published": int(r["published"] or 0),
-            "market_group": int(r["market_group"]) if (c_mktgrp and r["market_group"] is not None) else None,
+            "name": str(name),
+            "volume": float(vol) if vol is not None else 0.0,
+            "portionSize": int(portion) if portion is not None else 1,
         }
+    return types
 
-    # Activity time (seconds) per blueprint per activity
-    activity_time: Dict[Tuple[int, int], int] = {}
-    if has_table(conn, "industryActivity"):
-        ia_cols = table_columns(conn, "industryActivity")
-        c_ia_type = pick_col(ia_cols, "typeID")
-        c_ia_act = pick_col(ia_cols, "activityID")
-        c_ia_time = pick_col(ia_cols, "time")
-        for r in conn.execute(
-            f"SELECT {c_ia_type} AS type_id, {c_ia_act} AS act_id, {c_ia_time} AS time_s FROM industryActivity;"
-        ).fetchall():
-            activity_time[(int(r["type_id"]), int(r["act_id"]))] = int(r["time_s"] or 0)
 
-    def build_industry_recipes(activity_id: int) -> List[Dict[str, Any]]:
+def build_industry_recipes(conn: sqlite3.Connection, types: Dict[int, Dict[str, Any]], activity_id: int) -> List[Dict[str, Any]]:
+    """
+    Builds manufacturing or reaction recipes based on industryActivity* tables.
+    """
+    # Pull activity rows with products in one go
+    cur = conn.execute(
+        "SELECT ia.blueprintTypeID, ia.time, p.productTypeID, p.quantity "
+        "FROM industryActivity ia "
+        "JOIN industryActivityProducts p "
+        "  ON ia.blueprintTypeID = p.blueprintTypeID AND ia.activityID = p.activityID "
+        "WHERE ia.activityID = ?",
+        (activity_id,),
+    )
+
+    # Choose the primary product per blueprint: highest quantity
+    best_product: Dict[Tuple[int, int], Tuple[int, float]] = {}  # (bp, activity) -> (prod, qty)
+    time_s: Dict[Tuple[int, int], int] = {}
+
+    for bp_id, t, prod_id, qty in cur.fetchall():
+        key = (int(bp_id), activity_id)
+        time_s[key] = int(t) if t is not None else 0
+        prod = int(prod_id)
+        q = float(qty) if qty is not None else 1.0
+        prev = best_product.get(key)
+        if prev is None or q > prev[1]:
+            best_product[key] = (prod, q)
+
+    # Materials lookup prepared statement
+    mats_stmt = "SELECT materialTypeID, quantity FROM industryActivityMaterials WHERE blueprintTypeID = ? AND activityID = ?"
+
+    out: List[Dict[str, Any]] = []
+    for (bp, act), (prod, out_qty) in best_product.items():
         # Materials
-        iam_cols = table_columns(conn, "industryActivityMaterials")
-        c_bp = pick_col(iam_cols, "typeID")
-        c_act = pick_col(iam_cols, "activityID")
-        c_mat = pick_col(iam_cols, "materialTypeID")
-        c_qty = pick_col(iam_cols, "quantity")
-        mats_by_bp: Dict[int, List[Tuple[int, int]]] = {}
-        for r in conn.execute(
-            f"SELECT {c_bp} AS bp, {c_mat} AS mat, {c_qty} AS qty FROM industryActivityMaterials WHERE {c_act}=?;",
-            (activity_id,),
-        ).fetchall():
-            bp = int(r["bp"])
-            mats_by_bp.setdefault(bp, []).append((int(r["mat"]), int(r["qty"])))
-
-        # Products
-        iap_cols = table_columns(conn, "industryActivityProducts")
-        c_bp2 = pick_col(iap_cols, "typeID")
-        c_act2 = pick_col(iap_cols, "activityID")
-        c_prod = pick_col(iap_cols, "productTypeID")
-        c_pqty = pick_col(iap_cols, "quantity")
-        recipes: List[Dict[str, Any]] = []
-        for r in conn.execute(
-            f"SELECT {c_bp2} AS bp, {c_prod} AS prod, {c_pqty} AS pqty FROM industryActivityProducts WHERE {c_act2}=?;",
-            (activity_id,),
-        ).fetchall():
-            bp = int(r["bp"])
-            prod = int(r["prod"])
-            pqty = int(r["pqty"] or 1)
-
-            bp_info = types.get(bp, {"name": f"type {bp}"})
-            prod_info = types.get(prod, {"name": f"type {prod}"})
-
-            # Filter out unpublished products (helps avoid oddities).
-            if types.get(prod, {}).get("published", 1) == 0:
+        mats: List[Dict[str, Any]] = []
+        for mtid, mqty in conn.execute(mats_stmt, (bp, act)).fetchall():
+            mt = int(mtid)
+            q = float(mqty) if mqty is not None else 0.0
+            if q <= 0:
                 continue
+            mats.append({"type_id": mt, "name": types.get(mt, {}).get("name", f"type {mt}"), "qty": q})
 
-            mats = []
-            for mat_id, qty in mats_by_bp.get(bp, []):
-                mat_info = types.get(mat_id, {"name": f"type {mat_id}"})
-                mats.append({"type_id": mat_id, "name": mat_info["name"], "qty": qty})
-
-            recipes.append(
-                {
-                    "blueprint_type_id": bp,
-                    "blueprint_name": bp_info.get("name", f"type {bp}"),
-                    "product_type_id": prod,
-                    "product_name": prod_info.get("name", f"type {prod}"),
-                    "product_qty": pqty,
-                    "time_s": int(activity_time.get((bp, activity_id), 0)),
-                    "materials": mats,
-                }
-            )
-        return recipes
-
-    manufacturing = build_industry_recipes(ACTIVITY_MANUFACTURING)
-    reactions = build_industry_recipes(ACTIVITY_REACTIONS)
-
-    # Refining / reprocessing outputs (invTypeMaterials)
-    itm_cols = table_columns(conn, "invTypeMaterials")
-    c_itm_type = pick_col(itm_cols, "typeID")
-    c_itm_mat = pick_col(itm_cols, "materialTypeID")
-    c_itm_qty = pick_col(itm_cols, "quantity")
-
-    # We’ll capture all published + market-group items that have reprocessing outputs.
-    # This includes ores, ice, scrap modules, etc.
-    refining_by_input: Dict[int, List[Tuple[int, int]]] = {}
-    for r in conn.execute(
-        f"SELECT {c_itm_type} AS input_id, {c_itm_mat} AS out_id, {c_itm_qty} AS qty FROM invTypeMaterials;"
-    ).fetchall():
-        inp = int(r["input_id"])
-        out = int(r["out_id"])
-        qty = int(r["qty"] or 0)
-        if qty <= 0:
-            continue
-        refining_by_input.setdefault(inp, []).append((out, qty))
-
-    refining: List[Dict[str, Any]] = []
-    for inp, outs in refining_by_input.items():
-        info = types.get(inp)
-        if not info:
-            continue
-        if info.get("published", 1) == 0:
-            continue
-        if c_mktgrp and info.get("market_group") is None:
+        if not mats:
             continue
 
-        outputs = []
-        for out_id, qty in outs:
-            out_info = types.get(out_id, {"name": f"type {out_id}"})
-            outputs.append({"type_id": out_id, "name": out_info["name"], "qty": qty})
-
-        refining.append(
+        bp_name = types.get(bp, {}).get("name", f"type {bp}")
+        prod_name = types.get(prod, {}).get("name", f"type {prod}")
+        out.append(
             {
-                "input_type_id": inp,
-                "input_name": info["name"],
-                "portion_size": int(info.get("portion") or 1),
-                "volume": float(info.get("volume") or 0.0),
-                "outputs": outputs,
+                "blueprint_type_id": bp,
+                "blueprint_name": bp_name,
+                "product_type_id": prod,
+                "product_name": prod_name,
+                "output_qty": float(out_qty) if out_qty and out_qty > 0 else 1.0,
+                "time_s": int(time_s.get((bp, act), 0)),
+                "materials": mats,
             }
         )
 
-    conn.close()
+    return out
 
-    return {
-        "meta": {
-            "source": FUZZWORK_SDE_SQLITE_BZ2,
-            "note": "Derived recipe data from Fuzzwork's SDE SQLite conversion.",
-        },
+
+def build_refining_recipes(conn: sqlite3.Connection, types: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Builds reprocessing recipes from invTypeMaterials.
+    Attempts to restrict to ore/ice-like items by group/category names.
+    """
+    # Heuristic selection of candidate inputs with reprocessing yields.
+    # We join invGroups + invCategories to look at names.
+    cur = conn.execute(
+        "SELECT t.typeID, t.typeName, COALESCE(t.volume, 0), COALESCE(t.portionSize, 1), "
+        "       COALESCE(g.groupName, ''), COALESCE(c.categoryName, '') "
+        "FROM invTypes t "
+        "JOIN invGroups g ON t.groupID = g.groupID "
+        "JOIN invCategories c ON g.categoryID = c.categoryID "
+        "WHERE COALESCE(t.published, 1) = 1 "
+        "  AND t.typeID IN (SELECT DISTINCT typeID FROM invTypeMaterials)"
+    )
+
+    def looks_like_ore_or_ice(group_name: str, cat_name: str, type_name: str) -> bool:
+        s = f"{group_name} {cat_name} {type_name}".lower()
+        return ("asteroid" in s) or (" ore" in s) or s.endswith("ore") or ("ice" in s)
+
+    candidates: List[Tuple[int, str, float, int]] = []
+    for tid, tname, vol, portion, gname, cname in cur.fetchall():
+        tid = int(tid)
+        tname = str(tname)
+        gname = str(gname)
+        cname = str(cname)
+        if not looks_like_ore_or_ice(gname, cname, tname):
+            continue
+        portion_i = int(portion) if portion is not None else 1
+        if portion_i <= 0:
+            portion_i = 1
+        vol_f = float(vol) if vol is not None else 0.0
+        candidates.append((tid, tname, vol_f, portion_i))
+
+    # Now build outputs for each candidate
+    out: List[Dict[str, Any]] = []
+    stmt = "SELECT materialTypeID, quantity FROM invTypeMaterials WHERE typeID = ?"
+    for tid, tname, vol, portion in candidates:
+        outs: List[Dict[str, Any]] = []
+        for mtid, qty in conn.execute(stmt, (tid,)).fetchall():
+            mt = int(mtid)
+            q = float(qty) if qty is not None else 0.0
+            if q <= 0:
+                continue
+            outs.append({"type_id": mt, "name": types.get(mt, {}).get("name", f"type {mt}"), "qty": q})
+
+        if not outs:
+            continue
+
+        batch_units = portion
+        batch_m3 = float(batch_units) * float(vol)
+
+        out.append(
+            {
+                "input_type_id": tid,
+                "input_name": tname,
+                "batch_units": int(batch_units),
+                "batch_m3": float(batch_m3),
+                "outputs": outs,
+            }
+        )
+
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="data/recipes.json.gz", help="Output path for recipes.json.gz")
+    ap.add_argument("--force", action="store_true", help="Force re-download / re-decompress eve.db")
+    args = ap.parse_args()
+
+    out_path = Path(args.out)
+
+    ensure_eve_db(force=args.force)
+
+    print(f"[build_recipes] Opening SQLite: {EVE_DB_PATH}")
+    conn = sqlite3.connect(str(EVE_DB_PATH))
+    conn.row_factory = sqlite3.Row
+
+    try:
+        types = load_types(conn)
+        print(f"[build_recipes] Loaded {len(types)} published types")
+
+        manufacturing = build_industry_recipes(conn, types, activity_id=1)
+        print(f"[build_recipes] Manufacturing recipes: {len(manufacturing)}")
+
+        reactions = build_industry_recipes(conn, types, activity_id=11)
+        print(f"[build_recipes] Reaction recipes: {len(reactions)}")
+
+        refining = build_refining_recipes(conn, types)
+        print(f"[build_recipes] Refining recipes: {len(refining)}")
+
+    finally:
+        conn.close()
+
+    payload = {
+        "generated_at": utc_now_iso(),
+        "types": {str(k): v for k, v in types.items()},
         "manufacturing": manufacturing,
         "reactions": reactions,
         "refining": refining,
     }
 
-
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="data/recipes.json.gz", help="Output gzip JSON file.")
-    ap.add_argument("--cache-dir", default=".cache", help="Where to store downloaded SDE DB.")
-    ap.add_argument("--force", action="store_true", help="Rebuild even if output exists.")
-    args = ap.parse_args()
-
-    out_path = Path(args.out)
-    cache_dir = Path(args.cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    if out_path.exists() and not args.force:
-        print(f"[build_recipes] {out_path} already exists. Use --force to rebuild.")
-        return
-
-    bz2_path = cache_dir / "eve.db.bz2"
-    db_path = cache_dir / "eve.db"
-
-    if not bz2_path.exists():
-        print(f"[build_recipes] Downloading SDE SQLite from {FUZZWORK_SDE_SQLITE_BZ2}")
-        download(FUZZWORK_SDE_SQLITE_BZ2, bz2_path)
-
-    if not db_path.exists() or args.force:
-        print(f"[build_recipes] Decompressing {bz2_path} -> {db_path}")
-        decompress_bz2(bz2_path, db_path)
-
-    print("[build_recipes] Building recipes…")
-    recipes = build_recipes(db_path)
-
-    _ensure_parent(out_path)
+    ensure_parent(out_path)
+    print(f"[build_recipes] Writing: {out_path}")
     with gzip.open(out_path, "wt", encoding="utf-8") as f:
-        json.dump(recipes, f, ensure_ascii=False)
+        json.dump(payload, f)
 
-    print(f"[build_recipes] Wrote {out_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
