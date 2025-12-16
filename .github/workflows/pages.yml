@@ -34,27 +34,32 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      # Optional: cache the SDE + fuzzwork downloads to speed up runs
       - name: Cache downloads
         uses: actions/cache@v4
         with:
           path: .cache
-          key: ${{ runner.os }}-eve-cache-v1
+          key: ${{ runner.os }}-eve-cache-v2
           restore-keys: |
             ${{ runner.os }}-eve-cache-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Build daily rankings (writes docs/data/rankings.json)
         run: |
           python scripts/update_rankings.py \
             --pricing-scope region \
             --price-mode minmax \
-            --fee-rate 0.015 \
-            --reprocess-yield 0.82
+            --sales-tax 0.015 \
+            --broker-fee 0.0 \
+            --max-rows 60 \
+            --min-blueprint-sell-orders 1 \
+            --min-output-buy-orders 1 \
+            --min-ref-input-sell-orders 1 \
+            --min-ref-output-buy-orders 1 \
+            --out docs/data/rankings.json
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
