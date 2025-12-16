@@ -35,10 +35,11 @@ jobs:
 
       - name: Update rankings
         run: |
-          python scripts/update_rankings.py \
-            --price-mode minmax \
-            --fee-rate 0.015 \
-            --reprocess-yield 0.82
+python scripts/update_rankings.py \
+  --pricing-scope region \
+  --price-mode minmax \
+  --fee-rate 0.015 \
+  --reprocess-yield 0.82
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
