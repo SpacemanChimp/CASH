@@ -1,0 +1,81 @@
+{
+  "buy_market": "jita",
+  "sell_markets": [
+    "jita",
+    "amarr",
+    "hek",
+    "dodixie",
+    "rens",
+    "r-ag7w",
+    "e8-432",
+    "mj-5f9",
+    "r10-gn"
+  ],
+  "markets": [
+    {
+      "key": "jita",
+      "name": "Jita 4-4 (The Forge)",
+      "kind": "station",
+      "region_id": 10000002,
+      "station_id": 60003760
+    },
+    {
+      "key": "amarr",
+      "name": "Amarr (Domain)",
+      "kind": "station",
+      "region_id": 10000043,
+      "station_id": 60008494
+    },
+    {
+      "key": "hek",
+      "name": "Hek (Metropolis)",
+      "kind": "station",
+      "region_id": 10000042,
+      "station_id": 60005686
+    },
+    {
+      "key": "dodixie",
+      "name": "Dodixie (Sinq Laison)",
+      "kind": "station",
+      "region_id": 10000032,
+      "station_id": 60011866
+    },
+    {
+      "key": "rens",
+      "name": "Rens (Heimatar)",
+      "kind": "station",
+      "region_id": 10000030,
+      "station_id": 60004588
+    },
+    {
+      "key": "r-ag7w",
+      "name": "R-AG7W (structure market - requires structure_id + SSO)",
+      "kind": "structure",
+      "structure_id": null
+    },
+    {
+      "key": "e8-432",
+      "name": "E8-432 (structure market - requires structure_id + SSO)",
+      "kind": "structure",
+      "structure_id": null
+    },
+    {
+      "key": "mj-5f9",
+      "name": "MJ-5F9 (structure market - requires structure_id + SSO)",
+      "kind": "structure",
+      "structure_id": null
+    },
+    {
+      "key": "r10-gn",
+      "name": "R10-GN (structure market - requires structure_id + SSO)",
+      "kind": "structure",
+      "structure_id": null
+    }
+  ],
+  "_notes": [
+    "Outputs are valued at the best sell market among sell_markets.",
+    "Inputs/materials are priced from buy_market.",
+    "NPC station markets use region aggregates (Fuzzwork) + ESI region orders for depth.",
+    "Null-sec hubs are usually player structures; to enable them you must fill structure_id and add authenticated structure-market fetching."
+  ]
+}

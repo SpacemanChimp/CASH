@@ -78,6 +78,82 @@ ESI_DATASOURCE = "tranquility"
 DEFAULT_REGION_ID = 10000002  # The Forge
 DEFAULT_STATION_ID = 60003760  # Jita IV - Moon 4 - CNAP (NPC station)
 
+# ---- Multi-market sell (arbitrage) configuration ----
+# These are *market evaluation locations* (not where you must build).
+# Inputs are priced from the buy market (default: Jita/The Forge),
+# while outputs are valued at the best sell market among the configured sell markets.
+#
+# Note:
+# - Fuzzwork "aggregatecsv" and ESI region market orders cover NPC-station markets.
+# - Player structure markets (common in null-sec) require authenticated ESI calls to
+#   /markets/structures/{structure_id}/ and a character that can access that structure.
+#
+# You can edit data/markets.json to change these without touching code.
+MARKETS_CONFIG_PATH = Path("data/markets.json")
+
+DEFAULT_MARKETS: List[Dict[str, Any]] = [
+    {
+        "key": "jita",
+        "name": "Jita 4-4 (The Forge)",
+        "kind": "station",
+        "region_id": 10000002,
+        "station_id": 60003760,
+    },
+    {
+        "key": "amarr",
+        "name": "Amarr (Domain)",
+        "kind": "station",
+        "region_id": 10000043,
+        "station_id": 60008494,
+    },
+    {
+        "key": "hek",
+        "name": "Hek (Metropolis)",
+        "kind": "station",
+        "region_id": 10000042,
+        "station_id": 60005686,
+    },
+    {
+        "key": "dodixie",
+        "name": "Dodixie (Sinq Laison)",
+        "kind": "station",
+        "region_id": 10000032,
+        "station_id": 60011866,
+    },
+    {
+        "key": "rens",
+        "name": "Rens (Heimatar)",
+        "kind": "station",
+        "region_id": 10000030,
+        "station_id": 60004588,
+    },
+    # Null-sec hub placeholders (typically structure markets -> require structure_id + SSO token)
+    {"key": "r-ag7w", "name": "R-AG7W (structure market)", "kind": "structure", "structure_id": None},
+    {"key": "e8-432", "name": "E8-432 (structure market)", "kind": "structure", "structure_id": None},
+    {"key": "mj-5f9", "name": "MJ-5F9 (structure market)", "kind": "structure", "structure_id": None},
+    {"key": "r10-gn", "name": "R10-GN (structure market)", "kind": "structure", "structure_id": None},
+]
+
+DEFAULT_BUY_MARKET = "jita"
+DEFAULT_SELL_MARKETS = ["jita", "amarr", "hek", "dodixie", "rens"]
+
+
+def load_markets_config(path: Path = MARKETS_CONFIG_PATH) -> Dict[str, Any]:
+    """Loads market config from JSON, falling back to defaults."""
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {
+        "buy_market": DEFAULT_BUY_MARKET,
+        "sell_markets": DEFAULT_SELL_MARKETS,
+        "markets": DEFAULT_MARKETS,
+    }
+
 # Jita solar system ID (useful default for showing indices, though most builders use other systems)
 DEFAULT_SYSTEM_ID = 30000142  # Jita
 
@@ -91,6 +167,142 @@ AGG_CSV_CACHE = CACHE_DIR / "aggregatecsv.csv.gz"
 ESI_MAX_PAGES_PER_TYPE = 50
 ESI_TIMEOUT = 60
 ESI_SLEEP_S = 0.15  # be gentle
+
+
+SSO_TOKEN_URL = "https://login.eveonline.com/v2/oauth/token"
+
+
+def get_sso_access_token_from_env() -> Optional[str]:
+    """
+    Optional support for structure market orders (requires auth).
+
+    Provide either:
+      - EVE_SSO_ACCESS_TOKEN  (short-lived access token), or
+      - EVE_SSO_CLIENT_ID + EVE_SSO_CLIENT_SECRET + EVE_SSO_REFRESH_TOKEN
+
+    Required ESI scope for structure markets:
+      esi-markets.structure_markets.v1
+    """
+    access = (os.getenv("EVE_SSO_ACCESS_TOKEN") or "").strip()
+    if access:
+        return access
+
+    client_id = (os.getenv("EVE_SSO_CLIENT_ID") or "").strip()
+    client_secret = (os.getenv("EVE_SSO_CLIENT_SECRET") or "").strip()
+    refresh = (os.getenv("EVE_SSO_REFRESH_TOKEN") or "").strip()
+    if not (client_id and client_secret and refresh):
+        return None
+
+    try:
+        resp = requests.post(
+            SSO_TOKEN_URL,
+            data={"grant_type": "refresh_token", "refresh_token": refresh},
+            auth=requests.auth.HTTPBasicAuth(client_id, client_secret),
+            headers={"User-Agent": USER_AGENT},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        tok = (resp.json().get("access_token") or "").strip()
+        return tok or None
+    except Exception as e:
+        print(f"[update_rankings] Failed to refresh ESI token (structure markets will be skipped): {e}")
+        return None
+
+
+def fetch_structure_orders(structure_id: int, access_token: str) -> List[Dict[str, Any]]:
+    """Fetch all market orders for a structure (requires esi-markets.structure_markets.v1)."""
+    orders: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        url = f"{ESI_BASE}/markets/structures/{structure_id}/"
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Authorization": f"Bearer {access_token}",
+        }
+        r = requests.get(
+            url,
+            params={"datasource": "tranquility", "page": page},
+            headers=headers,
+            timeout=60,
+        )
+        if r.status_code == 403:
+            raise RuntimeError("403 forbidden (missing access or missing esi-markets.structure_markets.v1 scope)")
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            break
+        orders.extend(data)
+        x_pages = safe_int(r.headers.get("X-Pages"), page)
+        if page >= x_pages:
+            break
+        page += 1
+        time.sleep(ESI_SLEEP_S)
+    return orders
+
+
+def build_stats_from_orders(orders: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    """
+    Build a Fuzzwork-like stats dict from structure orders:
+      stats[type_id]["buy"|"sell"] = {min,max,median,weightedAverage,percentile,volume,orderCount,stddev}
+    """
+    acc: Dict[int, Dict[str, List[Tuple[float, int]]]] = {}
+    for o in orders:
+        try:
+            tid = int(o.get("type_id"))
+            side = "buy" if bool(o.get("is_buy_order")) else "sell"
+            price = float(o.get("price") or 0.0)
+            vol = int(o.get("volume_remain") or o.get("volume_total") or 0)
+        except Exception:
+            continue
+        if tid <= 0 or price <= 0 or vol <= 0:
+            continue
+        acc.setdefault(tid, {"buy": [], "sell": []})[side].append((price, vol))
+
+    def weighted_quantile(pv: List[Tuple[float, int]], q: float) -> float:
+        if not pv:
+            return 0.0
+        total = sum(v for _, v in pv)
+        if total <= 0:
+            return 0.0
+        target = q * total
+        cum = 0
+        for p, v in sorted(pv, key=lambda x: x[0]):
+            cum += v
+            if cum >= target:
+                return p
+        return sorted(pv, key=lambda x: x[0])[-1][0]
+
+    stats: Dict[int, Dict[str, Any]] = {}
+    for tid, sides in acc.items():
+        row: Dict[str, Any] = {}
+        for side in ("buy", "sell"):
+            pv = sides.get(side) or []
+            if not pv:
+                continue
+            total_vol = sum(v for _, v in pv)
+            wavg = sum(p * v for p, v in pv) / total_vol if total_vol > 0 else 0.0
+            var = sum(v * (p - wavg) ** 2 for p, v in pv) / total_vol if total_vol > 0 else 0.0
+            stddev = var ** 0.5
+            prices = [p for p, _ in pv]
+
+            # Approximate EVE "5% price" behavior:
+            #  - sell side: low-end 5% (conservative buying from sells)
+            #  - buy side: high-end 5% (conservative selling into buys) -> 95th percentile
+            perc = weighted_quantile(pv, 0.05 if side == "sell" else 0.95)
+
+            row[side] = {
+                "min": min(prices),
+                "max": max(prices),
+                "median": weighted_quantile(pv, 0.5),
+                "weightedAverage": wavg,
+                "stddev": stddev,
+                "volume": float(total_vol),
+                "orderCount": len(pv),
+                "percentile": perc,
+            }
+        if row:
+            stats[tid] = row
+    return stats
 
 
 def utc_now_iso() -> str:
@@ -270,6 +482,70 @@ def load_region_prices_from_aggregatecsv(cache_path: Path, region_id: int) -> Tu
     return prices, headers
 
 
+
+
+def load_multi_region_prices_from_aggregatecsv(
+    cache_path: Path, region_ids: Set[int]
+) -> Tuple[Dict[int, Dict[int, Dict[str, Any]]], Dict[str, str]]:
+    """
+    Loads Fuzzwork region aggregates for multiple regions in a single pass.
+
+    Returns:
+      prices_by_region[region_id][type_id] = {"buy": {...}, "sell": {...}}
+      headers (HTTP response headers from download if we downloaded)
+    """
+    headers: Dict[str, str] = {}
+    if not cache_path.exists():
+        print(f"[update_rankings] Downloading region aggregates CSV: {AGGREGATECSV_URL}")
+        headers = download_to(AGGREGATECSV_URL, cache_path)
+
+    # Initialize dicts so missing regions still exist
+    prices_by_region: Dict[int, Dict[int, Dict[str, Any]]] = {int(rid): {} for rid in region_ids}
+
+    with gzip.open(cache_path, "rt", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            what = row.get("what") or ""
+            parts = what.split("|")
+            if len(parts) != 3:
+                continue
+            try:
+                rid = int(parts[0])
+                if rid not in prices_by_region:
+                    continue
+                tid = int(parts[1])
+                is_buy = parts[2].lower() == "true"
+            except ValueError:
+                continue
+
+            def fnum(k: str) -> float:
+                v = row.get(k)
+                try:
+                    return float(v) if v not in (None, "") else 0.0
+                except ValueError:
+                    return 0.0
+
+            def inum(k: str) -> int:
+                v = row.get(k)
+                try:
+                    return int(float(v)) if v not in (None, "") else 0
+                except ValueError:
+                    return 0
+
+            side = "buy" if is_buy else "sell"
+            stats = prices_by_region[rid].setdefault(tid, {})
+            stats[side] = {
+                "weightedAverage": fnum("weightedaverage"),
+                "max": fnum("maxval"),
+                "min": fnum("minval"),
+                "stddev": fnum("stddev"),
+                "median": fnum("median"),
+                "volume": fnum("volume"),
+                "orderCount": inum("numorders"),
+                "percentile": fnum("fivepercent"),
+            }
+
+    return prices_by_region, headers
 def fuzz_price(stats: Dict[str, Any], side: str, mode: str) -> float:
     """
     side: "buy" or "sell"
@@ -643,7 +919,8 @@ def pick_depth_materials(materials: List[Dict[str, Any]], max_items: int = 6) ->
 
 
 def validate_depth_for_recipe(
-    region_id: int,
+    input_region_id: int,
+    output_region_id: int,
     output_type_id: int,
     output_qty_per_run: float,
     materials: List[Dict[str, Any]],
@@ -656,9 +933,9 @@ def validate_depth_for_recipe(
     Compute recommended runs using ESI region orderbooks for output + top materials.
     """
     # Fetch output buy orders (instant sale) and sell orders (patient sale)
-    out_buy_raw = fetch_region_orders(region_id, output_type_id, order_type="buy")
+    out_buy_raw = fetch_region_orders(output_region_id, output_type_id, order_type="buy")
     time.sleep(ESI_SLEEP_S)
-    out_sell_raw = fetch_region_orders(region_id, output_type_id, order_type="sell")
+    out_sell_raw = fetch_region_orders(output_region_id, output_type_id, order_type="sell")
 
     out_buy = normalize_orders(out_buy_raw, side="buy")
     out_sell = normalize_orders(out_sell_raw, side="sell")
@@ -669,7 +946,7 @@ def validate_depth_for_recipe(
 
     for m in depth_mats:
         tid = int(m["type_id"])
-        raw = fetch_region_orders(region_id, tid, order_type="sell")
+        raw = fetch_region_orders(input_region_id, tid, order_type="sell")
         time.sleep(ESI_SLEEP_S)
         mat_books[tid] = normalize_orders(raw, side="sell")
 
@@ -864,6 +1141,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--region-id", type=int, default=DEFAULT_REGION_ID)
     ap.add_argument("--station-id", type=int, default=DEFAULT_STATION_ID)
 
+    ap.add_argument("--markets-config", default=str(MARKETS_CONFIG_PATH),
+                    help="Path to markets.json (buy market + sell market set).")
+    ap.add_argument("--buy-market", default="",
+                    help="Market key to price inputs from (overrides --region-id when found in markets config).")
+    ap.add_argument("--sell-markets", default="",
+                    help="Comma-separated market keys to consider for best sell market (defaults from markets.json).")
+
+
     ap.add_argument("--price-mode", choices=["minmax", "percentile", "weighted"], default="percentile",
                     help="How to select prices from aggregates. percentile is safest.")
     ap.add_argument("--pricing-scope", choices=["region", "station"], default="region",
@@ -873,7 +1158,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--min-output-buy-orders", type=int, default=10)
     ap.add_argument("--min-blueprint-sell-orders", type=int, default=1)
     ap.add_argument("--min-job-time-s", type=int, default=60)
-    ap.add_argument("--max-rows", type=int, default=300, help="Max rows per category in output (after sorting)")
+    ap.add_argument("--max-rows", type=int, default=500, help="Max rows per category in output (after sorting)")
 
     # Refining filtering
     ap.add_argument("--min-ref-input-sell-orders", type=int, default=5)
@@ -891,7 +1176,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--depth-safety", type=float, default=0.80)
 
     # Taxes / costs
-    ap.add_argument("--sales-tax", type=float, default=0.03375, help="Sales tax rate (Accounting V ~3.375%)")
+    ap.add_argument("--sales-tax", type=float, default=0.03375, help="Sales tax rate (Accounting V ~3.375%%)")
     ap.add_argument("--broker-fee", type=float, default=0.01, help="Broker fee rate (varies by skills/standings)")
     ap.add_argument("--facility-tax", type=float, default=0.0, help="Structure facility tax applied to job install")
     ap.add_argument("--structure-job-bonus", type=float, default=0.0, help="Job cost reduction from rigs (e.g. 0.02)")
@@ -903,24 +1188,105 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--out", default=str(RANKINGS_PATH))
 
     args = ap.parse_args(argv)
+    # ---- Market configuration (buy market + sell markets) ----
+    markets_cfg = load_markets_config(Path(args.markets_config))
+    markets_list = markets_cfg.get("markets") or DEFAULT_MARKETS
 
-    region_id = args.region_id
-    station_id = args.station_id
+    # Merge defaults so core hubs always exist
+    market_by_key: Dict[str, Dict[str, Any]] = {}
+    for mkt in DEFAULT_MARKETS:
+        if isinstance(mkt, dict) and mkt.get("key"):
+            market_by_key[str(mkt["key"])] = mkt
+    for mkt in markets_list:
+        if isinstance(mkt, dict) and mkt.get("key"):
+            market_by_key[str(mkt["key"])] = mkt
+
+    buy_market_key = (args.buy_market or markets_cfg.get("buy_market") or DEFAULT_BUY_MARKET).strip()
+    if buy_market_key not in market_by_key:
+        print(f"[update_rankings] Unknown buy market '{buy_market_key}', falling back to {DEFAULT_BUY_MARKET}")
+        buy_market_key = DEFAULT_BUY_MARKET
+    buy_market = market_by_key[buy_market_key]
+    buy_region_id = safe_int(buy_market.get("region_id"), args.region_id)
+    buy_station_id = safe_int(buy_market.get("station_id"), args.station_id)
+
+    sell_markets_raw = (args.sell_markets or "").strip()
+    if not sell_markets_raw:
+        sell_markets_raw = ",".join(markets_cfg.get("sell_markets") or DEFAULT_SELL_MARKETS)
+    sell_market_keys = [s.strip() for s in sell_markets_raw.split(",") if s.strip()]
+    sell_market_keys = [k for k in sell_market_keys if k in market_by_key]
+    if not sell_market_keys:
+        sell_market_keys = DEFAULT_SELL_MARKETS[:]
+    if buy_market_key not in sell_market_keys:
+        sell_market_keys.insert(0, buy_market_key)
+
+    # Back-compat vars (the rest of the script historically assumes a single region/station):
+    region_id = buy_region_id
+    station_id = buy_station_id
 
     maybe_build_recipes(RECIPES_PATH, force=args.force_recipes)
     recipes = load_recipes(RECIPES_PATH)
 
     types: Dict[int, Dict[str, Any]] = {int(k): v for k, v in (recipes.get("types") or {}).items()}
 
-    # Load market aggregates (region scope baseline)
-    region_stats, agg_headers = load_region_prices_from_aggregatecsv(AGG_CSV_CACHE, region_id)
+    # Load market aggregates (region scope baseline) for *all* regions we need:
+    region_ids_needed: Set[int] = {region_id}
+    for mk in sell_market_keys:
+        rid = safe_int(market_by_key.get(mk, {}).get("region_id"), 0)
+        if rid > 0:
+            region_ids_needed.add(rid)
 
-    # NOTE: station pricing-scope is intentionally omitted in this "emperor" bundle, because
-    # station-level aggregates (Jita 4-4) will *miss* a lot of structure market activity.
-    # Keeping baseline as region + robust percentile is the safer default.
-    # You can still extend later with station-specific prices if desired.
+    region_stats_by_region, agg_headers = load_multi_region_prices_from_aggregatecsv(AGG_CSV_CACHE, region_ids_needed)
+    region_stats = region_stats_by_region.get(region_id, {})
+
+    # NOTE: station pricing-scope is still intentionally omitted in this bundle, because
+    # station-level aggregates (Jita 4-4 only) will *miss* structure market activity.
+    # Using region + robust percentile is the safer default.
     pricing_scope = args.pricing_scope
-    stats = region_stats  # currently we treat as source-of-truth
+    stats = region_stats  # legacy alias (buy region)
+
+
+    # Optional: load authenticated structure-market stats (null-sec hubs, private citadels, etc.)
+    structure_stats_by_market: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    structure_market_keys = [
+        k
+        for k in sell_market_keys
+        if (market_by_key.get(k) or {}).get("kind") == "structure"
+        and safe_int((market_by_key.get(k) or {}).get("structure_id"), 0) > 0
+    ]
+
+    if structure_market_keys:
+        token = get_sso_access_token_from_env()
+        if not token:
+            print("[update_rankings] Structure markets configured but no EVE SSO token provided; skipping structure markets.")
+        else:
+            for mk in structure_market_keys:
+                sid = safe_int((market_by_key.get(mk) or {}).get("structure_id"), 0)
+                if sid <= 0:
+                    continue
+                try:
+                    print(f"[update_rankings] Fetching structure market orders for {mk} (structure_id={sid})")
+                    orders = fetch_structure_orders(sid, token)
+                    structure_stats_by_market[mk] = build_stats_from_orders(orders)
+                except Exception as e:
+                    print(f"[update_rankings] Failed to fetch structure market {mk}: {e}")
+
+    def market_stats(mk: str, tid: int) -> Dict[str, Any]:
+        mkt = market_by_key.get(mk) or {}
+        kind = (mkt.get("kind") or "station").lower()
+        if kind == "structure":
+            return (structure_stats_by_market.get(mk) or {}).get(tid, {})
+        rid = safe_int(mkt.get("region_id"), 0)
+        if rid <= 0:
+            return {}
+        return (region_stats_by_region.get(rid) or {}).get(tid, {})
+
+    def market_price(mk: str, tid: int, side: str) -> float:
+        return fuzz_price(market_stats(mk, tid), side=side, mode=args.price_mode)
+
+    def market_order_count(mk: str, tid: int, side: str) -> int:
+        s = market_stats(mk, tid).get(side) or {}
+        return safe_int(s.get("orderCount"), 0)
+
 
     # Load ESI adjusted prices and system cost indices (for job install)
     print("[update_rankings] Fetching ESI adjusted prices and cost indices…")
@@ -938,18 +1304,35 @@ def main(argv: Optional[List[str]] = None) -> int:
         structure_job_bonus=args.structure_job_bonus,
     )
 
-    # Helper: get stats for a type
-    def tstats(tid: int) -> Dict[str, Any]:
-        return stats.get(tid, {})
+        # Helper: get stats for a type
+    def tstats(tid: int, rid: Optional[int] = None) -> Dict[str, Any]:
+        rr = region_stats_by_region.get(int(rid) if rid else region_id, {})
+        return rr.get(tid, {})
 
-    def price(tid: int, side: str) -> float:
-        return fuzz_price(tstats(tid), side=side, mode=args.price_mode)
+    def price(tid: int, side: str, rid: Optional[int] = None) -> float:
+        return fuzz_price(tstats(tid, rid=rid), side=side, mode=args.price_mode)
 
-    def order_count(tid: int, side: str) -> int:
-        s = tstats(tid).get(side) or {}
+    def order_count(tid: int, side: str, rid: Optional[int] = None) -> int:
+        s = tstats(tid, rid=rid).get(side) or {}
         return safe_int(s.get("orderCount"), 0)
 
-    # Compute manufacturing rows
+    def best_sell_market(tid: int, side: str, min_orders: int) -> Tuple[Optional[str], float]:
+        """Returns (market_key, price) for the best market among sell_market_keys."""
+        best_key: Optional[str] = None
+        best_p: float = 0.0
+        for mk in sell_market_keys:
+            rid = safe_int(market_by_key.get(mk, {}).get("region_id"), 0)
+            if rid <= 0:
+                continue
+            if order_count(tid, side, rid=rid) < min_orders:
+                continue
+            p = price(tid, side, rid=rid)
+            if p > best_p:
+                best_p = p
+                best_key = mk
+        return best_key, best_p
+
+# Compute manufacturing rows
     print("[update_rankings] Computing manufacturing rankings…")
     manufacturing_rows: List[Dict[str, Any]] = []
     for r in recipes.get("manufacturing") or []:
@@ -968,9 +1351,54 @@ def main(argv: Optional[List[str]] = None) -> int:
         if bp_sell_orders < args.min_blueprint_sell_orders or bp_cost <= 0:
             continue
 
-        # Output must have enough buy orders (instant sale)
-        if order_count(prod_tid, "buy") < args.min_output_buy_orders:
+        # Output must be sellable in at least one of the configured sell markets.
+        # Instant mode: sell to buy orders -> use the best buy price among sell_market_keys.
+        out_buy_by_market: Dict[str, float] = {}
+        out_sell_by_market: Dict[str, float] = {}
+        out_buy_orders_by_market: Dict[str, int] = {}
+        out_sell_orders_by_market: Dict[str, int] = {}
+
+        best_buy_market: Optional[str] = None
+        best_buy_price: float = 0.0
+        best_sell_market_key: Optional[str] = None
+        best_sell_price: float = 0.0
+
+        for mk in sell_market_keys:
+            pb = market_price(mk, prod_tid, "buy")
+            ps = market_price(mk, prod_tid, "sell")
+            ob = market_order_count(mk, prod_tid, "buy")
+            os_ = market_order_count(mk, prod_tid, "sell")
+            if pb <= 0 and ps <= 0 and ob <= 0 and os_ <= 0:
+                continue
+            out_buy_by_market[mk] = pb
+            out_sell_by_market[mk] = ps
+            out_buy_orders_by_market[mk] = ob
+            out_sell_orders_by_market[mk] = os_
+            if ob >= args.min_output_buy_orders and pb > best_buy_price:
+                best_buy_price = pb
+                best_buy_market = mk
+            if os_ > 0 and ps > best_sell_price:
+                best_sell_price = ps
+                best_sell_market_key = mk
+
+        if not best_buy_market or best_buy_price <= 0:
             continue
+
+        if not best_sell_market_key or best_sell_price <= 0:
+            best_sell_market_key = best_buy_market
+            best_sell_price = out_sell_by_market.get(best_sell_market_key) or 0.0
+
+        out_buy = best_buy_price
+        out_sell = best_sell_price
+        out_buy_market = best_buy_market
+        out_sell_market = best_sell_market_key
+        out_buy_region_id = safe_int(market_by_key.get(out_buy_market, {}).get("region_id"), 0)
+        out_sell_region_id = safe_int(market_by_key.get(out_sell_market, {}).get("region_id"), 0)
+        out_buy_structure_id = safe_int(market_by_key.get(out_buy_market, {}).get("structure_id"), 0)
+        out_sell_structure_id = safe_int(market_by_key.get(out_sell_market, {}).get("structure_id"), 0)
+        out_buy_market_kind = (market_by_key.get(out_buy_market, {}).get("kind") or "station")
+        out_sell_market_kind = (market_by_key.get(out_sell_market, {}).get("kind") or "station")
+
 
         mats = r.get("materials") or []
         # Attach both sell/buy unit prices so the UI can toggle modes later
@@ -1003,8 +1431,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         for m in mats2:
             m["extended_instant"] = safe_float(m.get("qty"), 0.0) * safe_float(m.get("unit_price_sell"), 0.0)
 
-        out_buy = price(prod_tid, "buy")
-        out_sell = price(prod_tid, "sell")
 
         job_cost = job_install_cost(adjusted_prices, mats2, mfg_cost_index, fee_model)
 
@@ -1032,7 +1458,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
         # Confidence for the output market
-        c0, c_details = compute_confidence_from_stats(tstats(prod_tid))
+        c0, c_details = compute_confidence_from_stats(market_stats(out_buy_market, prod_tid))
         confidence = c0
         if args.confidence_history:
             # We only fetch history later for top candidates (to avoid huge API spam)
@@ -1052,6 +1478,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             "product_name": r.get("product_name") or types.get(prod_tid, {}).get("name", f"type {prod_tid}"),
             "output_qty": out_qty,
             "time_s": time_s,
+            "buy_market": buy_market_key,
+            "sell_instant_market": out_buy_market,
+            "sell_instant_market_name": (market_by_key.get(out_buy_market) or {}).get("name") or out_buy_market,
+            "sell_instant_kind": out_buy_market_kind,
+            "sell_instant_region_id": out_buy_region_id,
+            "sell_instant_structure_id": out_buy_structure_id,
+            "sell_patient_market": out_sell_market,
+            "sell_patient_market_name": (market_by_key.get(out_sell_market) or {}).get("name") or out_sell_market,
+            "sell_patient_kind": out_sell_market_kind,
+            "sell_patient_region_id": out_sell_region_id,
+            "sell_patient_structure_id": out_sell_structure_id,
+            "sell_markets_considered": sell_market_keys,
+            "output_buy_by_market": out_buy_by_market,
+            "output_sell_by_market": out_sell_by_market,
+            "output_buy_orders_by_market": out_buy_orders_by_market,
+            "output_sell_orders_by_market": out_sell_orders_by_market,
             "blueprint_cost": bp_cost,
             "blueprint_sell_orders": bp_sell_orders,
             "confidence": confidence,
@@ -1089,8 +1531,53 @@ def main(argv: Optional[List[str]] = None) -> int:
         if bp_sell_orders < args.min_blueprint_sell_orders or bp_cost <= 0:
             continue
 
-        if order_count(prod_tid, "buy") < args.min_output_buy_orders:
+        # Output must be sellable in at least one of the configured sell markets.
+        out_buy_by_market: Dict[str, float] = {}
+        out_sell_by_market: Dict[str, float] = {}
+        out_buy_orders_by_market: Dict[str, int] = {}
+        out_sell_orders_by_market: Dict[str, int] = {}
+
+        best_buy_market: Optional[str] = None
+        best_buy_price: float = 0.0
+        best_sell_market_key: Optional[str] = None
+        best_sell_price: float = 0.0
+
+        for mk in sell_market_keys:
+            pb = market_price(mk, prod_tid, "buy")
+            ps = market_price(mk, prod_tid, "sell")
+            ob = market_order_count(mk, prod_tid, "buy")
+            os_ = market_order_count(mk, prod_tid, "sell")
+            if pb <= 0 and ps <= 0 and ob <= 0 and os_ <= 0:
+                continue
+            out_buy_by_market[mk] = pb
+            out_sell_by_market[mk] = ps
+            out_buy_orders_by_market[mk] = ob
+            out_sell_orders_by_market[mk] = os_
+            if ob >= args.min_output_buy_orders and pb > best_buy_price:
+                best_buy_price = pb
+                best_buy_market = mk
+            if os_ > 0 and ps > best_sell_price:
+                best_sell_price = ps
+                best_sell_market_key = mk
+
+        if not best_buy_market or best_buy_price <= 0:
             continue
+
+        if not best_sell_market_key or best_sell_price <= 0:
+            best_sell_market_key = best_buy_market
+            best_sell_price = out_sell_by_market.get(best_sell_market_key) or 0.0
+
+        out_buy = best_buy_price
+        out_sell = best_sell_price
+        out_buy_market = best_buy_market
+        out_sell_market = best_sell_market_key
+        out_buy_region_id = safe_int(market_by_key.get(out_buy_market, {}).get("region_id"), 0)
+        out_sell_region_id = safe_int(market_by_key.get(out_sell_market, {}).get("region_id"), 0)
+        out_buy_structure_id = safe_int(market_by_key.get(out_buy_market, {}).get("structure_id"), 0)
+        out_sell_structure_id = safe_int(market_by_key.get(out_sell_market, {}).get("structure_id"), 0)
+        out_buy_market_kind = (market_by_key.get(out_buy_market, {}).get("kind") or "station")
+        out_sell_market_kind = (market_by_key.get(out_sell_market, {}).get("kind") or "station")
+
 
         mats = r.get("materials") or []
         mats2: List[Dict[str, Any]] = []
@@ -1118,8 +1605,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         for m in mats2:
             m["extended_instant"] = safe_float(m.get("qty"), 0.0) * safe_float(m.get("unit_price_sell"), 0.0)
 
-        out_buy = price(prod_tid, "buy")
-        out_sell = price(prod_tid, "sell")
 
         job_cost = job_install_cost(adjusted_prices, mats2, rx_cost_index, fee_model)
 
@@ -1146,7 +1631,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             job_cost_per_run=job_cost,
         )
 
-        c0, c_details = compute_confidence_from_stats(tstats(prod_tid))
+        c0, c_details = compute_confidence_from_stats(market_stats(out_buy_market, prod_tid))
         confidence = c0
 
         profit_per_hour = instant["profit"] / (time_s / 3600) if time_s > 0 else None
@@ -1159,6 +1644,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             "product_name": r.get("product_name") or types.get(prod_tid, {}).get("name", f"type {prod_tid}"),
             "output_qty": out_qty,
             "time_s": time_s,
+            "buy_market": buy_market_key,
+            "sell_instant_market": out_buy_market,
+            "sell_instant_market_name": (market_by_key.get(out_buy_market) or {}).get("name") or out_buy_market,
+            "sell_instant_kind": out_buy_market_kind,
+            "sell_instant_region_id": out_buy_region_id,
+            "sell_instant_structure_id": out_buy_structure_id,
+            "sell_patient_market": out_sell_market,
+            "sell_patient_market_name": (market_by_key.get(out_sell_market) or {}).get("name") or out_sell_market,
+            "sell_patient_kind": out_sell_market_kind,
+            "sell_patient_region_id": out_sell_region_id,
+            "sell_patient_structure_id": out_sell_structure_id,
+            "sell_markets_considered": sell_market_keys,
+            "output_buy_by_market": out_buy_by_market,
+            "output_sell_by_market": out_sell_by_market,
+            "output_buy_orders_by_market": out_buy_orders_by_market,
+            "output_sell_orders_by_market": out_sell_orders_by_market,
             "blueprint_cost": bp_cost,
             "blueprint_sell_orders": bp_sell_orders,
             "confidence": confidence,
@@ -1274,8 +1775,53 @@ def main(argv: Optional[List[str]] = None) -> int:
             continue
         if time_s < args.min_job_time_s:
             continue
-        if order_count(prod_tid, "buy") < args.min_output_buy_orders:
+        # Output must be sellable in at least one of the configured sell markets.
+        out_buy_by_market: Dict[str, float] = {}
+        out_sell_by_market: Dict[str, float] = {}
+        out_buy_orders_by_market: Dict[str, int] = {}
+        out_sell_orders_by_market: Dict[str, int] = {}
+
+        best_buy_market: Optional[str] = None
+        best_buy_price: float = 0.0
+        best_sell_market_key: Optional[str] = None
+        best_sell_price: float = 0.0
+
+        for mk in sell_market_keys:
+            pb = market_price(mk, prod_tid, "buy")
+            ps = market_price(mk, prod_tid, "sell")
+            ob = market_order_count(mk, prod_tid, "buy")
+            os_ = market_order_count(mk, prod_tid, "sell")
+            if pb <= 0 and ps <= 0 and ob <= 0 and os_ <= 0:
+                continue
+            out_buy_by_market[mk] = pb
+            out_sell_by_market[mk] = ps
+            out_buy_orders_by_market[mk] = ob
+            out_sell_orders_by_market[mk] = os_
+            if ob >= args.min_output_buy_orders and pb > best_buy_price:
+                best_buy_price = pb
+                best_buy_market = mk
+            if os_ > 0 and ps > best_sell_price:
+                best_sell_price = ps
+                best_sell_market_key = mk
+
+        if not best_buy_market or best_buy_price <= 0:
             continue
+
+        if not best_sell_market_key or best_sell_price <= 0:
+            best_sell_market_key = best_buy_market
+            best_sell_price = out_sell_by_market.get(best_sell_market_key) or 0.0
+
+        out_buy = best_buy_price
+        out_sell = best_sell_price
+        out_buy_market = best_buy_market
+        out_sell_market = best_sell_market_key
+        out_buy_region_id = safe_int(market_by_key.get(out_buy_market, {}).get("region_id"), 0)
+        out_sell_region_id = safe_int(market_by_key.get(out_sell_market, {}).get("region_id"), 0)
+        out_buy_structure_id = safe_int(market_by_key.get(out_buy_market, {}).get("structure_id"), 0)
+        out_sell_structure_id = safe_int(market_by_key.get(out_sell_market, {}).get("structure_id"), 0)
+        out_buy_market_kind = (market_by_key.get(out_buy_market, {}).get("kind") or "station")
+        out_sell_market_kind = (market_by_key.get(out_sell_market, {}).get("kind") or "station")
+
 
         inv = invention_map[t2_bp]
         p = safe_float(inv.get("probability"), 0.4)
@@ -1351,8 +1897,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         inv_time_per_success = inv_time_s * expected_attempts_per_success
         inv_time_per_run = inv_time_per_success / runs_per_success
 
-        out_buy = price(prod_tid, "buy")
-        out_sell = price(prod_tid, "sell")
 
         # Instant mode: buy inputs from sell, sell output to buy, include sales tax, include mfg job install, plus invention overhead
         instant_mfg = compute_mode_metrics(
@@ -1376,7 +1920,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         total_time_s_per_run = time_s + inv_time_per_run
         profit_per_total_hour = instant_profit / (total_time_s_per_run / 3600) if total_time_s_per_run > 0 else None
 
-        c0, c_details = compute_confidence_from_stats(tstats(prod_tid))
+        c0, c_details = compute_confidence_from_stats(market_stats(out_buy_market, prod_tid))
         confidence = c0
 
         t2_rows.append({
@@ -1387,6 +1931,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             "t2_blueprint_name": r.get("blueprint_name") or types.get(t2_bp, {}).get("name", f"type {t2_bp}"),
             "output_qty": out_qty,
             "time_s": time_s,
+            "buy_market": buy_market_key,
+            "sell_instant_market": out_buy_market,
+            "sell_instant_market_name": (market_by_key.get(out_buy_market) or {}).get("name") or out_buy_market,
+            "sell_instant_kind": out_buy_market_kind,
+            "sell_instant_region_id": out_buy_region_id,
+            "sell_instant_structure_id": out_buy_structure_id,
+            "sell_patient_market": out_sell_market,
+            "sell_patient_market_name": (market_by_key.get(out_sell_market) or {}).get("name") or out_sell_market,
+            "sell_patient_kind": out_sell_market_kind,
+            "sell_patient_region_id": out_sell_region_id,
+            "sell_patient_structure_id": out_sell_structure_id,
+            "sell_markets_considered": sell_market_keys,
+            "output_buy_by_market": out_buy_by_market,
+            "output_sell_by_market": out_sell_by_market,
+            "output_buy_orders_by_market": out_buy_orders_by_market,
+            "output_sell_orders_by_market": out_sell_orders_by_market,
             "confidence": confidence,
             "confidence_details": c_details,
             "materials": instant_mfg["materials"],
@@ -1528,16 +2088,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                     out_tid = int(row["product_type_id"])
                     out_qty = safe_float(row.get("output_qty"), 1.0)
                     mats = row.get("materials") or []
-                    depth = validate_depth_for_recipe(
-                        region_id=region_id,
-                        output_type_id=out_tid,
-                        output_qty_per_run=out_qty,
-                        materials=mats,
-                        input_slippage=args.input_slippage,
-                        output_slippage=args.output_slippage,
-                        safety=args.depth_safety,
-                        max_materials=args.depth_max_materials,
-                    )
+                    out_rid = safe_int(row.get("sell_instant_region_id"), 0)
+                    if out_rid > 0:
+                        depth = validate_depth_for_recipe(
+                            input_region_id=region_id,
+                            output_region_id=out_rid,
+                            output_type_id=out_tid,
+                            output_qty_per_run=out_qty,
+                            materials=mats,
+                            input_slippage=args.input_slippage,
+                            output_slippage=args.output_slippage,
+                            safety=args.depth_safety,
+                            max_materials=args.depth_max_materials,
+                        )
+                    else:
+                        depth = {}
                     # Attach scaled expectation at the recommended run count
                     rec = int(depth.get("recommended_runs") or 1)
                     inst = row.get("instant") or {}
@@ -1644,6 +2209,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         "market": {
             "region_id": region_id,
             "station_id": station_id,
+            "buy_market": buy_market_key,
+            "sell_markets": sell_market_keys,
+            "markets": [market_by_key[k] for k in sorted(market_by_key.keys())],
             "pricing_scope": pricing_scope,
             "price_mode": args.price_mode,
         },
