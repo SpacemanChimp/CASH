@@ -1,82 +1,32 @@
-# EVE Money Button (GitHub Pages)
+# EVE Money Button — Emperor Edition
 
-A static site + GitHub Actions pipeline that:
+This repo builds a static GitHub Pages site that answers one question:
 
-1. Pulls **market aggregates** (Fuzzwork)
-2. Compares against **SDE recipes** (manufacturing, reactions, reprocessing)
-3. Publishes **top-ranked “do this to make money” picks** to a GitHub Pages site.
-
-> ⚠️ This is decision-support, not a guarantee. Always sanity-check volume, liquidity, hauling risk, industry job fees, and your own bonuses.
-
----
+> "What should I build/refine/react today to make ISK in Jita / The Forge?"
 
 ## What you get
 
-- **Manufacturing**: Top profitable builds (includes blueprint *payback runs* if a BPO market price exists)
-- **Reactions**: Top profitable reactions
-- **Refining**: Best reprocess/refine candidates **ranked by ISK per m³ of input batch volume** (space efficiency)
+- **Manufacturing** rankings (T1 / general manufacturing)
+- **Reactions** rankings
+- **Refining** rankings (ore/ice/moon/compressed inputs)
+- **T2 (Invention)** rankings (T1 invention + T2 manufacturing amortized)
+- **Confidence score (0–100)** to filter out meme markets
+- **Depth-based recommended runs/batches** (orderbook slippage caps) for top candidates
+- **Plan Builder** that creates buy/sell lists and estimates slots + hauling
 
-The site lives in `/docs` so GitHub Pages can serve it directly.
-
----
-
-## Setup (10–15 minutes of clicking)
-
-1. Create a new GitHub repo (e.g. `eve-money-button`)
-2. Copy the contents of this project into it
-3. In GitHub:
-   - **Settings → Pages**
-   - Source: `Deploy from a branch`
-   - Branch: `main` / Folder: `/docs`
-4. In GitHub:
-   - **Settings → Actions → General**
-   - Workflow permissions: **Read and write**
-5. Go to **Actions → “Update EVE Money Button Rankings” → Run workflow**
-   - First run will also build `data/recipes.json.gz` by downloading the SDE SQLite.
-
-After the workflow commits `docs/data/rankings.json`, your site will show the tables.
-
----
-
-## Customizing assumptions
-
-In `.github/workflows/update.yml`, edit the script flags:
-
-- `--price-mode`:
-  - `minmax` = buy materials at min sell, sell outputs at max buy (fast execution)
-  - `percentile` = 5% average (smoother / less outlier sensitivity)
-  - `weighted` = weighted average
-- `--fee-rate` = tax/fees to subtract from revenue (default: 0.03)
-- `--reprocess-yield` = your effective refine yield (default: 0.7)
-
-Example:
+## Local run
 
 ```bash
-python scripts/update_rankings.py --price-mode minmax --fee-rate 0.015 --reprocess-yield 0.82
+python -m pip install -r requirements.txt
+python scripts/update_rankings.py --out docs/data/rankings.json
+python -m http.server --directory docs 8000
 ```
 
----
+Then open http://localhost:8000
 
-## Updating recipe data (SDE changes)
+## GitHub Pages
 
-Recipe data changes rarely, but when it does:
+1. Repo Settings → Pages → Source: **GitHub Actions**
+2. Run the workflow **Build and Deploy (EVE Money Button)** (or push to `main`)
 
-- Run the workflow with `--force-recipes`
-  - or delete `data/recipes.json.gz` and run again.
-
----
-
-## Roadmap ideas (easy next wins)
-
-- Add filters: “only T1”, “exclude capitals”, “min daily volume”
-- Add ESI login (SSO) to personalize:
-  - owned blueprints
-  - skills / structure bonuses
-  - current inventory/assets
-- Add “shopping list” and “sell list” export formats
-
----
-
-## License
-
-MIT
+The workflow refreshes rankings on a schedule (default every 6 hours).
