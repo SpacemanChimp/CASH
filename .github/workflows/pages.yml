@@ -4,14 +4,8 @@ on:
   workflow_dispatch:
   push:
     branches: ["main"]
-    paths:
-      - "scripts/**"
-      - "docs/**"
-      - "data/**"
-      - ".github/workflows/**"
-      - "requirements.txt"
   schedule:
-    - cron: "0 */6 * * *" # every 6 hours
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: read
@@ -29,6 +23,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: DEBUG - list workflow files and search for old flags
+        run: |
+          echo "== .github/workflows contents =="
+          ls -la .github/workflows || true
+          echo ""
+          echo "== Searching for deprecated flags in repo =="
+          grep -RIn             -e '--fee-rate'             -e '--reprocess-yield'             -e '--min-bpo-sell-orders'             -e '--limit-mfg'             -e '--limit-rx'             -e '--limit-ref'             .github/workflows scripts || true
+          echo ""
+          echo "If you see matches above, that file is still calling old CLI flags and must be updated/deleted."
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -38,7 +42,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .cache
-          key: ${{ runner.os }}-eve-cache-v4
+          key: ${{ runner.os }}-eve-cache-v5
           restore-keys: |
             ${{ runner.os }}-eve-cache-
 
