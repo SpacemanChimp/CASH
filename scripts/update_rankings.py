@@ -1,1301 +1,1313 @@
 #!/usr/bin/env python3
 """
-update_rankings.py
+EVE "Money Button" — Rankings Generator (Arbitrage + Emperor features)
 
-Reads recipe data (data/recipes.json.gz), fetches market prices, computes rankings,
-and writes docs/data/rankings.json for GitHub Pages.
+This script generates `docs/data/rankings.json` for the static GitHub Pages site.
 
-Core concepts
-- "Instant" mode: buy inputs from sell orders; sell outputs to buy orders.
-  Conservative and fast to execute.
-- "Patient" mode: place buy orders for inputs; list sell orders for outputs.
-  Higher theoretical margin, but slower + broker fees.
+Key features
+- Multi-market arbitrage: buy inputs in ONE "buy market", evaluate selling outputs across MANY "sell markets",
+  and select the best destination (per mode: Instant vs Patient).
+- Conservative execution modes:
+  * Instant: buy inputs from sell orders, sell outputs into buy orders (fastest, lowest thinking).
+  * Patient: buy inputs via buy orders, sell outputs via sell orders (higher margin, slower to realize).
+- Confidence score (0–100) to down-rank manipulated / dead / illiquid items.
+- Depth simulation for top-N rows (real orderbooks) to compute:
+  * Max runs by input depth (input slippage tolerance)
+  * Max runs by output depth (output slippage tolerance)
+  * Recommended runs (with safety buffer)
+  * "Guaranteed executable profit" label when recommended runs are still profitable after fees/taxes/slippage
+- Time-to-liquidate estimate (bucketed) from ESI regional market history (where available).
+- Hauling sanity metrics (m³/run, profit per m³).
+- Optional EVE SSO (refresh-token) support to:
+  * Read your character skills (for job time modifiers)
+  * Read structure markets (null/low hub structures) via authenticated ESI
 
-New "Emperor" upgrades included:
-1) Recommended batch size (depth validation)
-   - For top N candidates per category, fetch ESI region orderbooks for the
-     output + top-cost materials and compute:
-       max runs by input depth (slippage cap)
-       max runs by output depth (slippage cap)
-       recommended runs (safety factor)
-       expected profit at that scale using the orderbook, not just top-of-book
-
-2) Confidence score (0-100)
-   - Penalizes: low order count, low order volume, wide spread, high volatility,
-     spiky percentile vs min/max.
-
-3) Proper-ish industry costs and taxes
-   - Job install cost approximated using ESI adjusted prices and system cost index
-     from /industry/systems/.
-   - Market fees include sales tax and (optionally) broker fee for patient mode.
-
-4) T2 / Invention pipeline tab
-   - Uses invention mappings precomputed in recipes.json.gz (activityID=8).
-   - Computes invention-amortized cost/run and time/run.
-
-5) Refining made durable
-   - Refining recipes come from invTypeMaterials for ore/ice/moon/compressed-like items.
-   - Refining uses region prices by default to avoid station scope wiping out data.
-   - Separate liquidity thresholds for refining.
-
-Notes / limitations (important for making real ISK)
-- ESI region orderbooks do NOT include structure-only markets (citadels) except ranged
-  orders. That means depth validation can undercount Perimeter/other structure liquidity.
-  Baseline pricing uses Fuzzwork aggregates, which may include more complete data.
-- This tool does not include hauling, liquidity/turnover constraints beyond confidence,
-  or structure/rig/skill ME/TE rounding. It is meant to get you to the right lane fast,
-  then you execute like an industrialist.
+Notes / reality checks
+- Nothing can *guarantee* profit in a player market; the goal is to minimize "looks good but isn't executable".
+- Station/region markets are sourced from Fuzzwork aggregates for speed.
+- Structure markets require SSO and can be heavy to fetch (ESI has no type filter for structure orders).
 
 """
-
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import gzip
 import json
 import math
 import os
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 
-
 # -----------------------------
-# Config defaults
+# Constants / paths
 # -----------------------------
-
-AGGREGATECSV_URL = "https://market.fuzzwork.co.uk/aggregatecsv.csv.gz"
 
 ESI_BASE = "https://esi.evetech.net/latest"
 ESI_DATASOURCE = "tranquility"
 
-DEFAULT_REGION_ID = 10000002  # The Forge
-DEFAULT_STATION_ID = 60003760  # Jita IV - Moon 4 - CNAP (NPC station)
-
-# ---- Multi-market sell (arbitrage) configuration ----
-# These are *market evaluation locations* (not where you must build).
-# Inputs are priced from the buy market (default: Jita/The Forge),
-# while outputs are valued at the best sell market among the configured sell markets.
-#
-# Note:
-# - Fuzzwork "aggregatecsv" and ESI region market orders cover NPC-station markets.
-# - Player structure markets (common in null-sec) require authenticated ESI calls to
-#   /markets/structures/{structure_id}/ and a character that can access that structure.
-#
-# You can edit data/markets.json to change these without touching code.
-MARKETS_CONFIG_PATH = Path("data/markets.json")
-
-DEFAULT_MARKETS: List[Dict[str, Any]] = [
-    {
-        "key": "jita",
-        "name": "Jita 4-4 (The Forge)",
-        "kind": "station",
-        "region_id": 10000002,
-        "station_id": 60003760,
-    },
-    {
-        "key": "amarr",
-        "name": "Amarr (Domain)",
-        "kind": "station",
-        "region_id": 10000043,
-        "station_id": 60008494,
-    },
-    {
-        "key": "hek",
-        "name": "Hek (Metropolis)",
-        "kind": "station",
-        "region_id": 10000042,
-        "station_id": 60005686,
-    },
-    {
-        "key": "dodixie",
-        "name": "Dodixie (Sinq Laison)",
-        "kind": "station",
-        "region_id": 10000032,
-        "station_id": 60011866,
-    },
-    {
-        "key": "rens",
-        "name": "Rens (Heimatar)",
-        "kind": "station",
-        "region_id": 10000030,
-        "station_id": 60004588,
-    },
-    # Null-sec hub placeholders (typically structure markets -> require structure_id + SSO token)
-    {"key": "r-ag7w", "name": "R-AG7W (structure market)", "kind": "structure", "structure_id": None},
-    {"key": "e8-432", "name": "E8-432 (structure market)", "kind": "structure", "structure_id": None},
-    {"key": "mj-5f9", "name": "MJ-5F9 (structure market)", "kind": "structure", "structure_id": None},
-    {"key": "r10-gn", "name": "R10-GN (structure market)", "kind": "structure", "structure_id": None},
-]
-
-DEFAULT_BUY_MARKET = "jita"
-DEFAULT_SELL_MARKETS = ["jita", "amarr", "hek", "dodixie", "rens"]
-
-
-def load_markets_config(path: Path = MARKETS_CONFIG_PATH) -> Dict[str, Any]:
-    """Loads market config from JSON, falling back to defaults."""
-    if path.exists():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-    return {
-        "buy_market": DEFAULT_BUY_MARKET,
-        "sell_markets": DEFAULT_SELL_MARKETS,
-        "markets": DEFAULT_MARKETS,
-    }
-
-# Jita solar system ID (useful default for showing indices, though most builders use other systems)
-DEFAULT_SYSTEM_ID = 30000142  # Jita
+FUZZWORK_STATION_AGG_URL = "https://market.fuzzwork.co.uk/aggregates/"
+FUZZWORK_AGGREGATECSV_URL = "https://www.fuzzwork.co.uk/dump/latest/aggregatecsv.csv.bz2"
 
 RECIPES_PATH = Path("data/recipes.json.gz")
-RANKINGS_PATH = Path("docs/data/rankings.json")
-
+OUT_PATH_DEFAULT = Path("docs/data/rankings.json")
 CACHE_DIR = Path(".cache")
-AGG_CSV_CACHE = CACHE_DIR / "aggregatecsv.csv.gz"
 
-# Orderbook validation limits
-ESI_MAX_PAGES_PER_TYPE = 50
-ESI_TIMEOUT = 60
-ESI_SLEEP_S = 0.15  # be gentle
+STATION_AGG_CHUNK = 200  # max types per fuzzwork station aggregates request
 
 
-SSO_TOKEN_URL = "https://login.eveonline.com/v2/oauth/token"
-
-
-def get_sso_access_token_from_env() -> Optional[str]:
-    """
-    Optional support for structure market orders (requires auth).
-
-    Provide either:
-      - EVE_SSO_ACCESS_TOKEN  (short-lived access token), or
-      - EVE_SSO_CLIENT_ID + EVE_SSO_CLIENT_SECRET + EVE_SSO_REFRESH_TOKEN
-
-    Required ESI scope for structure markets:
-      esi-markets.structure_markets.v1
-    """
-    access = (os.getenv("EVE_SSO_ACCESS_TOKEN") or "").strip()
-    if access:
-        return access
-
-    client_id = (os.getenv("EVE_SSO_CLIENT_ID") or "").strip()
-    client_secret = (os.getenv("EVE_SSO_CLIENT_SECRET") or "").strip()
-    refresh = (os.getenv("EVE_SSO_REFRESH_TOKEN") or "").strip()
-    if not (client_id and client_secret and refresh):
-        return None
-
-    try:
-        resp = requests.post(
-            SSO_TOKEN_URL,
-            data={"grant_type": "refresh_token", "refresh_token": refresh},
-            auth=requests.auth.HTTPBasicAuth(client_id, client_secret),
-            headers={"User-Agent": USER_AGENT},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        tok = (resp.json().get("access_token") or "").strip()
-        return tok or None
-    except Exception as e:
-        print(f"[update_rankings] Failed to refresh ESI token (structure markets will be skipped): {e}")
-        return None
-
-
-def fetch_structure_orders(structure_id: int, access_token: str) -> List[Dict[str, Any]]:
-    """Fetch all market orders for a structure (requires esi-markets.structure_markets.v1)."""
-    orders: List[Dict[str, Any]] = []
-    page = 1
-    while True:
-        url = f"{ESI_BASE}/markets/structures/{structure_id}/"
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Authorization": f"Bearer {access_token}",
-        }
-        r = requests.get(
-            url,
-            params={"datasource": "tranquility", "page": page},
-            headers=headers,
-            timeout=60,
-        )
-        if r.status_code == 403:
-            raise RuntimeError("403 forbidden (missing access or missing esi-markets.structure_markets.v1 scope)")
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list):
-            break
-        orders.extend(data)
-        x_pages = safe_int(r.headers.get("X-Pages"), page)
-        if page >= x_pages:
-            break
-        page += 1
-        time.sleep(ESI_SLEEP_S)
-    return orders
-
-
-def build_stats_from_orders(orders: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
-    """
-    Build a Fuzzwork-like stats dict from structure orders:
-      stats[type_id]["buy"|"sell"] = {min,max,median,weightedAverage,percentile,volume,orderCount,stddev}
-    """
-    acc: Dict[int, Dict[str, List[Tuple[float, int]]]] = {}
-    for o in orders:
-        try:
-            tid = int(o.get("type_id"))
-            side = "buy" if bool(o.get("is_buy_order")) else "sell"
-            price = float(o.get("price") or 0.0)
-            vol = int(o.get("volume_remain") or o.get("volume_total") or 0)
-        except Exception:
-            continue
-        if tid <= 0 or price <= 0 or vol <= 0:
-            continue
-        acc.setdefault(tid, {"buy": [], "sell": []})[side].append((price, vol))
-
-    def weighted_quantile(pv: List[Tuple[float, int]], q: float) -> float:
-        if not pv:
-            return 0.0
-        total = sum(v for _, v in pv)
-        if total <= 0:
-            return 0.0
-        target = q * total
-        cum = 0
-        for p, v in sorted(pv, key=lambda x: x[0]):
-            cum += v
-            if cum >= target:
-                return p
-        return sorted(pv, key=lambda x: x[0])[-1][0]
-
-    stats: Dict[int, Dict[str, Any]] = {}
-    for tid, sides in acc.items():
-        row: Dict[str, Any] = {}
-        for side in ("buy", "sell"):
-            pv = sides.get(side) or []
-            if not pv:
-                continue
-            total_vol = sum(v for _, v in pv)
-            wavg = sum(p * v for p, v in pv) / total_vol if total_vol > 0 else 0.0
-            var = sum(v * (p - wavg) ** 2 for p, v in pv) / total_vol if total_vol > 0 else 0.0
-            stddev = var ** 0.5
-            prices = [p for p, _ in pv]
-
-            # Approximate EVE "5% price" behavior:
-            #  - sell side: low-end 5% (conservative buying from sells)
-            #  - buy side: high-end 5% (conservative selling into buys) -> 95th percentile
-            perc = weighted_quantile(pv, 0.05 if side == "sell" else 0.95)
-
-            row[side] = {
-                "min": min(prices),
-                "max": max(prices),
-                "median": weighted_quantile(pv, 0.5),
-                "weightedAverage": wavg,
-                "stddev": stddev,
-                "volume": float(total_vol),
-                "orderCount": len(pv),
-                "percentile": perc,
-            }
-        if row:
-            stats[tid] = row
-    return stats
-
+# -----------------------------
+# Small utilities
+# -----------------------------
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def utc_date_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
-def ensure_parent(p: Path) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-
-
-def clamp01(x: float) -> float:
-    return 0.0 if x <= 0 else (1.0 if x >= 1 else x)
-
-
-def safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
+def ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def safe_int(x: Any, default: int = 0) -> int:
     try:
-        if x is None:
-            return default
         return int(x)
     except Exception:
         return default
 
 
+def safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def chunked(seq: List[int], n: int) -> Iterable[List[int]]:
+    for i in range(0, len(seq), n):
+        yield seq[i : i + n]
+
+
 # -----------------------------
-# HTTP helpers
+# Markets config
 # -----------------------------
 
-def http_get_json(url: str, timeout: int = 60, retries: int = 3, sleep_s: float = 1.0) -> Any:
+@dataclass(frozen=True)
+class Market:
+    key: str
+    name: str
+    kind: str  # "station" | "region" | "structure"
+    region_id: Optional[int] = None
+    station_id: Optional[int] = None
+    structure_id: Optional[int] = None
+    system_name: Optional[str] = None
+    system_id: Optional[int] = None
+
+    @property
+    def location_id(self) -> Optional[int]:
+        return self.station_id or self.structure_id
+
+    def is_valid(self) -> bool:
+        if self.kind == "station":
+            return self.station_id is not None and self.region_id is not None
+        if self.kind == "region":
+            return self.region_id is not None
+        if self.kind == "structure":
+            return self.structure_id is not None and self.structure_id != 0
+        return False
+
+
+@dataclass
+class MarketsConfig:
+    markets: Dict[str, Market]
+    default_buy: str
+    default_sells: List[str]
+
+
+def load_markets_config(path: Path) -> MarketsConfig:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    mkts: Dict[str, Market] = {}
+    for key, m in (raw.get("markets") or {}).items():
+        mkts[key] = Market(
+            key=key,
+            name=str(m.get("name") or key),
+            kind=str(m.get("kind") or "station"),
+            region_id=m.get("region_id"),
+            station_id=m.get("station_id"),
+            structure_id=m.get("structure_id"),
+            system_name=m.get("system_name"),
+            system_id=m.get("system_id"),
+        )
+    default_buy = str(raw.get("default_buy") or "jita")
+    default_sells = list(raw.get("default_sells") or [])
+    return MarketsConfig(markets=mkts, default_buy=default_buy, default_sells=default_sells)
+
+
+def parse_csv_list(s: Optional[str]) -> List[str]:
+    if not s:
+        return []
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+# -----------------------------
+# EVE SSO (optional)
+# -----------------------------
+
+def _b64url_decode(segment: str) -> bytes:
+    pad = "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(segment + pad)
+
+
+def decode_jwt_no_verify(token: str) -> Dict[str, Any]:
+    # Token is a JWT: header.payload.signature
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload = json.loads(_b64url_decode(parts[1]).decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def sso_access_token_from_refresh(
+    client_id: str, client_secret: str, refresh_token: str, timeout_s: int = 20
+) -> Optional[str]:
+    # OAuth refresh flow (confidential clients)
+    auth = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
     headers = {
-        "User-Agent": "eve-money-button/1.0 (+https://github.com/)",
-        "Accept": "application/json",
+        "Authorization": f"Basic {auth}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "eve-money-button/1.0",
     }
-    last_err: Optional[Exception] = None
-    for i in range(retries):
+    data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
+    url = "https://login.eveonline.com/v2/oauth/token"
+    try:
+        r = requests.post(url, headers=headers, data=data, timeout=timeout_s)
+        r.raise_for_status()
+        j = r.json()
+        return j.get("access_token")
+    except Exception:
+        return None
+
+
+def fetch_character_id_and_name(access_token: str, timeout_s: int = 20) -> Tuple[Optional[int], Optional[str]]:
+    # Best effort:
+    # 1) decode JWT (no verify) for sub/name
+    # 2) fallback to legacy oauth/verify if available
+    claims = decode_jwt_no_verify(access_token)
+    sub = claims.get("sub") or ""
+    name = claims.get("name")
+    char_id: Optional[int] = None
+    if isinstance(sub, str) and "CHARACTER" in sub:
+        # Often "CHARACTER:EVE:<id>"
         try:
-            r = requests.get(url, headers=headers, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_err = e
-            if i < retries - 1:
-                time.sleep(sleep_s * (1.5 ** i))
-    raise last_err or RuntimeError("http_get_json failed")
+            char_id = int(sub.split(":")[-1])
+        except Exception:
+            char_id = None
+
+    if char_id and name:
+        return char_id, str(name)
+
+    # Fallback: oauth/verify (deprecated but still widely used)
+    try:
+        r = requests.get(
+            "https://login.eveonline.com/oauth/verify",
+            headers={"Authorization": f"Bearer {access_token}", "User-Agent": "eve-money-button/1.0"},
+            timeout=timeout_s,
+        )
+        r.raise_for_status()
+        j = r.json()
+        return safe_int(j.get("CharacterID"), None), j.get("CharacterName")
+    except Exception:
+        return char_id, str(name) if name else (None, None)
 
 
-def http_get(url: str, timeout: int = 60, retries: int = 3, sleep_s: float = 1.0, stream: bool = False) -> requests.Response:
-    headers = {
-        "User-Agent": "eve-money-button/1.0 (+https://github.com/)",
-        "Accept": "*/*",
-    }
-    last_err: Optional[Exception] = None
-    for i in range(retries):
-        try:
-            r = requests.get(url, headers=headers, timeout=timeout, stream=stream)
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            last_err = e
-            if i < retries - 1:
-                time.sleep(sleep_s * (1.5 ** i))
-    raise last_err or RuntimeError("http_get failed")
+def esi_get(url: str, access_token: Optional[str] = None, timeout_s: int = 30) -> Any:
+    headers = {"User-Agent": "eve-money-button/1.0"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    r = requests.get(url, headers=headers, timeout=timeout_s)
+    r.raise_for_status()
+    return r.json()
 
 
-def download_to(url: str, dest: Path, timeout: int = 120) -> Dict[str, str]:
+def fetch_character_skills(access_token: str, character_id: int) -> Dict[int, int]:
+    # returns mapping skill_type_id -> active_skill_level
+    url = f"{ESI_BASE}/characters/{character_id}/skills/?datasource={ESI_DATASOURCE}"
+    try:
+        j = esi_get(url, access_token=access_token, timeout_s=30)
+        skills = j.get("skills") or []
+        out: Dict[int, int] = {}
+        for s in skills:
+            sid = safe_int(s.get("skill_id"), 0)
+            lvl = safe_int(s.get("active_skill_level"), 0)
+            if sid:
+                out[sid] = max(out.get(sid, 0), lvl)
+        return out
+    except Exception:
+        return {}
+
+
+# -----------------------------
+# Price sources
+# -----------------------------
+
+def fuzz_price(stats: Dict[str, Any], side: str, mode: str) -> float:
+    """
+    Convert fuzzwork-like stats into a single 'effective price' number.
+    side: "buy" or "sell" (from the orderbook perspective).
+    mode:
+      - minmax: buy=max, sell=min
+      - percentile: use 5% (percentile) when available, else weightedAverage
+      - weighted: weightedAverage
+    """
+    if not stats or side not in stats or not isinstance(stats[side], dict):
+        return 0.0
+    s = stats[side]
+    if mode == "minmax":
+        return safe_float(s.get("max" if side == "buy" else "min"), 0.0)
+    if mode == "percentile":
+        p = safe_float(s.get("percentile"), 0.0)
+        if p > 0:
+            return p
+        return safe_float(s.get("weightedAverage"), 0.0)
+    # weighted
+    return safe_float(s.get("weightedAverage"), 0.0)
+
+
+def fuzz_order_count(stats: Dict[str, Any], side: str) -> int:
+    if not stats or side not in stats or not isinstance(stats[side], dict):
+        return 0
+    return safe_int(stats[side].get("orderCount"), 0)
+
+
+def fuzz_volume(stats: Dict[str, Any], side: str) -> float:
+    if not stats or side not in stats or not isinstance(stats[side], dict):
+        return 0.0
+    return safe_float(stats[side].get("volume"), 0.0)
+
+
+def download_file(url: str, dest: Path, timeout_s: int = 60) -> None:
     ensure_parent(dest)
-    with http_get(url, timeout=timeout, retries=3, stream=True) as r:
-        headers = {k: v for k, v in r.headers.items()}
+    with requests.get(url, stream=True, timeout=timeout_s, headers={"User-Agent": "eve-money-button/1.0"}) as r:
+        r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
-    return headers
 
 
-def download_if_stale(url: str, dest: Path, max_age_s: int) -> Dict[str, str]:
+def load_region_prices_from_aggregatecsv(
+    cache_csv_path: Path,
+    region_ids: Set[int],
+    type_filter: Optional[Set[int]] = None,
+) -> Dict[int, Dict[int, Dict[str, Any]]]:
     """
-    Download dest if missing or older than max_age_s.
-    Returns headers if downloaded, else {}.
+    Load fuzzwork aggregatecsv and keep only requested region_ids, and optionally only type_filter.
+    Returns prices[region_id][type_id] -> {"buy": {...}, "sell": {...}}
     """
-    if dest.exists():
-        age = time.time() - dest.stat().st_mtime
-        if age < max_age_s:
-            return {}
-    print(f"[update_rankings] Downloading: {url}")
-    return download_to(url, dest)
+    ensure_parent(cache_csv_path)
+    if not cache_csv_path.exists():
+        bz2_path = cache_csv_path.with_suffix(".bz2")
+        if not bz2_path.exists():
+            print(f"[prices] Downloading {FUZZWORK_AGGREGATECSV_URL}")
+            download_file(FUZZWORK_AGGREGATECSV_URL, bz2_path)
+        print(f"[prices] Decompressing {bz2_path.name} -> {cache_csv_path.name}")
+        import bz2  # stdlib
+
+        with bz2.open(bz2_path, "rb") as src, open(cache_csv_path, "wb") as dst:
+            dst.write(src.read())
+
+    prices: Dict[int, Dict[int, Dict[str, Any]]] = {rid: {} for rid in region_ids}
+    with open(cache_csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rid = safe_int(row.get("regionID"), 0)
+            if rid not in region_ids:
+                continue
+            tid = safe_int(row.get("typeID"), 0)
+            if not tid:
+                continue
+            if type_filter is not None and tid not in type_filter:
+                continue
+            side = row.get("buySell")  # "b" or "s"
+            if side not in ("b", "s"):
+                continue
+            side_key = "buy" if side == "b" else "sell"
+            entry = prices[rid].setdefault(tid, {"buy": {}, "sell": {}})
+            entry[side_key] = {
+                "weightedAverage": safe_float(row.get("weightedAvg"), 0.0),
+                "max": safe_float(row.get("max"), 0.0),
+                "min": safe_float(row.get("min"), 0.0),
+                "stddev": safe_float(row.get("stddev"), 0.0),
+                "median": safe_float(row.get("median"), 0.0),
+                "volume": safe_float(row.get("volume"), 0.0),
+                "orderCount": safe_int(row.get("orderCount"), 0),
+                "percentile": safe_float(row.get("fivePercent"), 0.0),
+            }
+    return prices
+
+
+def fetch_fuzzwork_station_aggregates(station_id: int, type_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    """
+    Returns mapping type_id -> {"buy": {...}, "sell": {...}}
+    """
+    out: Dict[int, Dict[str, Any]] = {}
+    if not type_ids:
+        return out
+
+    for chunk in chunked(type_ids, STATION_AGG_CHUNK):
+        params = {"station": station_id, "types": ",".join(str(x) for x in chunk)}
+        try:
+            r = requests.get(FUZZWORK_STATION_AGG_URL, params=params, timeout=60, headers={"User-Agent": "eve-money-button/1.0"})
+            r.raise_for_status()
+            j = r.json()
+            # Response keys are strings of type_id
+            for k, v in j.items():
+                tid = safe_int(k, 0)
+                if not tid or not isinstance(v, dict):
+                    continue
+                # normalize: ensure buy/sell dicts exist if present
+                vv: Dict[str, Any] = {"buy": {}, "sell": {}}
+                if isinstance(v.get("buy"), dict):
+                    vv["buy"] = v["buy"]
+                if isinstance(v.get("sell"), dict):
+                    vv["sell"] = v["sell"]
+                out[tid] = vv
+        except Exception:
+            # keep going; missing chunks shouldn't kill the whole run
+            continue
+    return out
+
+
+def compute_stats_from_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Build fuzzwork-like stats dict for a side from a list of orders with fields:
+      price, volume_remain
+    """
+    if not orders:
+        return {"weightedAverage": 0.0, "max": 0.0, "min": 0.0, "stddev": 0.0, "median": 0.0, "volume": 0.0, "orderCount": 0, "percentile": 0.0}
+
+    # For weighted average and percentile, weight by remaining volume.
+    # Percentile here is "5% price" approximation: weighted average of best 5% of volume.
+    prices: List[Tuple[float, float]] = []
+    total_vol = 0.0
+    for o in orders:
+        p = safe_float(o.get("price"), 0.0)
+        v = safe_float(o.get("volume_remain") or o.get("volume_remain"), 0.0)
+        if p <= 0 or v <= 0:
+            continue
+        prices.append((p, v))
+        total_vol += v
+    if not prices or total_vol <= 0:
+        return {"weightedAverage": 0.0, "max": 0.0, "min": 0.0, "stddev": 0.0, "median": 0.0, "volume": 0.0, "orderCount": 0, "percentile": 0.0}
+
+    # Sort by price for percentile calc; caller should provide the right direction for side.
+    # Here we assume orders passed are already sorted "best first".
+    weighted_sum = sum(p * v for p, v in prices)
+    wavg = weighted_sum / total_vol
+
+    # median by volume
+    cum = 0.0
+    median_price = prices[-1][0]
+    for p, v in prices:
+        cum += v
+        if cum >= total_vol / 2.0:
+            median_price = p
+            break
+
+    # stddev (volume-weighted)
+    var = sum(v * ((p - wavg) ** 2) for p, v in prices) / total_vol
+    stddev = math.sqrt(var)
+
+    # 5% percentile (best 5% of volume)
+    target = total_vol * 0.05
+    take = 0.0
+    take_sum = 0.0
+    for p, v in prices:
+        if take >= target:
+            break
+        dv = min(v, target - take)
+        take += dv
+        take_sum += p * dv
+    percentile = take_sum / take if take > 0 else wavg
+
+    max_p = max(p for p, _ in prices)
+    min_p = min(p for p, _ in prices)
+    return {
+        "weightedAverage": wavg,
+        "max": max_p,
+        "min": min_p,
+        "stddev": stddev,
+        "median": median_price,
+        "volume": total_vol,
+        "orderCount": len(prices),
+        "percentile": percentile,
+    }
 
 
 # -----------------------------
-# Recipes
+# Recipes + SDE-derived type info
 # -----------------------------
 
-def load_recipes(recipes_path: Path) -> Dict[str, Any]:
-    with gzip.open(recipes_path, "rt", encoding="utf-8") as f:
+def read_json_gz(path: Path) -> Any:
+    with gzip.open(path, "rt", encoding="utf-8") as f:
         return json.load(f)
 
 
-def maybe_build_recipes(recipes_path: Path, force: bool = False) -> None:
-    if recipes_path.exists() and not force:
+def maybe_build_recipes(force: bool = False) -> None:
+    if RECIPES_PATH.exists() and not force:
         return
     print("[update_rankings] recipes.json.gz missing or forced; building from SDE (one-time-ish)…")
     import subprocess
-    cmd = [sys.executable, "scripts/build_recipes.py", "--out", str(recipes_path)]
-    if force:
-        cmd.append("--force")
-    subprocess.check_call(cmd)
+
+    subprocess.check_call(["python", "scripts/build_recipes.py", "--out", str(RECIPES_PATH)])
+
+
+def load_recipes() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    data = read_json_gz(RECIPES_PATH)
+    recipes = data.get("recipes") or {}
+    types = data.get("types") or {}
+    return recipes, types
 
 
 # -----------------------------
-# Market aggregates (Fuzzwork)
+# ESI: adjusted prices + system indices + market data
 # -----------------------------
 
-def load_region_prices_from_aggregatecsv(cache_path: Path, region_id: int) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, str]]:
-    """
-    Returns:
-      prices[type_id] = {"buy": {...}, "sell": {...}}
-      headers from download (if we downloaded), else {}.
-    """
-    headers = download_if_stale(AGGREGATECSV_URL, cache_path, max_age_s=25 * 60)
+def fetch_adjusted_prices() -> Dict[int, float]:
+    url = f"{ESI_BASE}/markets/prices/?datasource={ESI_DATASOURCE}"
+    try:
+        j = esi_get(url, access_token=None, timeout_s=30)
+        out: Dict[int, float] = {}
+        for row in j:
+            tid = safe_int(row.get("type_id"), 0)
+            ap = row.get("adjusted_price")
+            if tid and ap is not None:
+                out[tid] = safe_float(ap, 0.0)
+        return out
+    except Exception:
+        return {}
 
-    prices: Dict[int, Dict[str, Any]] = {}
-    with gzip.open(cache_path, "rt", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            what = row.get("what") or ""
-            parts = what.split("|")
-            if len(parts) != 3:
+
+def fetch_system_cost_indices(system_id: int) -> Dict[int, float]:
+    """
+    Returns mapping activity_id -> cost_index for a system.
+    Activity IDs:
+      1 manufacturing
+      11 reactions
+      8 invention
+    """
+    url = f"{ESI_BASE}/industry/systems/?datasource={ESI_DATASOURCE}"
+    try:
+        j = esi_get(url, access_token=None, timeout_s=60)
+        for row in j:
+            sid = safe_int(row.get("solar_system_id"), 0)
+            if sid != system_id:
                 continue
-            try:
-                rid = int(parts[0])
-                if rid != region_id:
-                    continue
-                tid = int(parts[1])
-                is_buy = parts[2].lower() == "true"
-            except Exception:
-                continue
-
-            def fnum(k: str) -> float:
-                v = row.get(k)
-                try:
-                    return float(v) if v not in (None, "") else 0.0
-                except Exception:
-                    return 0.0
-
-            def inum(k: str) -> int:
-                v = row.get(k)
-                try:
-                    return int(float(v)) if v not in (None, "") else 0
-                except Exception:
-                    return 0
-
-            side = "buy" if is_buy else "sell"
-            prices.setdefault(tid, {})
-            prices[tid][side] = {
-                "weightedAverage": fnum("weightedaverage"),
-                "max": fnum("maxval"),
-                "min": fnum("minval"),
-                "stddev": fnum("stddev"),
-                "median": fnum("median"),
-                "volume": fnum("volume"),
-                "orderCount": inum("numorders"),
-                "percentile": fnum("fivepercent"),
-            }
-
-    return prices, headers
-
-
-
-
-def load_multi_region_prices_from_aggregatecsv(
-    cache_path: Path, region_ids: Set[int]
-) -> Tuple[Dict[int, Dict[int, Dict[str, Any]]], Dict[str, str]]:
-    """
-    Loads Fuzzwork region aggregates for multiple regions in a single pass.
-
-    Returns:
-      prices_by_region[region_id][type_id] = {"buy": {...}, "sell": {...}}
-      headers (HTTP response headers from download if we downloaded)
-    """
-    headers: Dict[str, str] = {}
-    if not cache_path.exists():
-        print(f"[update_rankings] Downloading region aggregates CSV: {AGGREGATECSV_URL}")
-        headers = download_to(AGGREGATECSV_URL, cache_path)
-
-    # Initialize dicts so missing regions still exist
-    prices_by_region: Dict[int, Dict[int, Dict[str, Any]]] = {int(rid): {} for rid in region_ids}
-
-    with gzip.open(cache_path, "rt", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            what = row.get("what") or ""
-            parts = what.split("|")
-            if len(parts) != 3:
-                continue
-            try:
-                rid = int(parts[0])
-                if rid not in prices_by_region:
-                    continue
-                tid = int(parts[1])
-                is_buy = parts[2].lower() == "true"
-            except ValueError:
-                continue
-
-            def fnum(k: str) -> float:
-                v = row.get(k)
-                try:
-                    return float(v) if v not in (None, "") else 0.0
-                except ValueError:
-                    return 0.0
-
-            def inum(k: str) -> int:
-                v = row.get(k)
-                try:
-                    return int(float(v)) if v not in (None, "") else 0
-                except ValueError:
-                    return 0
-
-            side = "buy" if is_buy else "sell"
-            stats = prices_by_region[rid].setdefault(tid, {})
-            stats[side] = {
-                "weightedAverage": fnum("weightedaverage"),
-                "max": fnum("maxval"),
-                "min": fnum("minval"),
-                "stddev": fnum("stddev"),
-                "median": fnum("median"),
-                "volume": fnum("volume"),
-                "orderCount": inum("numorders"),
-                "percentile": fnum("fivepercent"),
-            }
-
-    return prices_by_region, headers
-def fuzz_price(stats: Dict[str, Any], side: str, mode: str) -> float:
-    """
-    side: "buy" or "sell"
-    mode:
-      - "minmax": buy=max buy, sell=min sell (top-of-book)
-      - "percentile": use 5% average (fivepercent) when available, else fallback
-      - "weighted": weightedAverage
-    """
-    if not stats or side not in stats:
-        return 0.0
-    s = stats[side]
-    if mode == "weighted":
-        return float(s.get("weightedAverage") or 0.0)
-    if mode == "percentile":
-        p = float(s.get("percentile") or 0.0)
-        if p > 0:
-            return p
-        # fallback
-        if side == "sell":
-            return float(s.get("min") or 0.0)
-        return float(s.get("max") or 0.0)
-    # minmax
-    if side == "sell":
-        return float(s.get("min") or 0.0)
-    return float(s.get("max") or 0.0)
-
-
-# -----------------------------
-# ESI helpers
-# -----------------------------
-
-def esi_url(path: str, **params: Any) -> str:
-    # Always include datasource.
-    q = {"datasource": ESI_DATASOURCE}
-    q.update({k: v for k, v in params.items() if v is not None})
-    qs = "&".join(f"{k}={requests.utils.quote(str(v))}" for k, v in q.items())
-    if not path.startswith("/"):
-        path = "/" + path
-    return f"{ESI_BASE}{path}?{qs}"
-
-
-def fetch_adjusted_prices() -> Dict[int, Dict[str, float]]:
-    """
-    /markets/prices/ => [{type_id, adjusted_price, average_price}, ...]
-    """
-    url = esi_url("/markets/prices/")
-    data = http_get_json(url, timeout=ESI_TIMEOUT, retries=3, sleep_s=1.0)
-    out: Dict[int, Dict[str, float]] = {}
-    for row in data:
-        try:
-            tid = int(row.get("type_id"))
-        except Exception:
-            continue
-        out[tid] = {
-            "adjusted": safe_float(row.get("adjusted_price"), 0.0),
-            "average": safe_float(row.get("average_price"), 0.0),
-        }
-    return out
-
-
-def fetch_system_cost_indices() -> Dict[int, Dict[str, float]]:
-    """
-    /industry/systems/ => [{solar_system_id, cost_indices:[{activity,cost_index},...]},...]
-    Returns mapping: system_id -> {activity_name: cost_index}
-    """
-    url = esi_url("/industry/systems/")
-    data = http_get_json(url, timeout=ESI_TIMEOUT, retries=3, sleep_s=1.0)
-    out: Dict[int, Dict[str, float]] = {}
-    for row in data:
-        sid = safe_int(row.get("solar_system_id"), 0)
-        if sid <= 0:
-            continue
-        cmap: Dict[str, float] = {}
-        for ci in row.get("cost_indices", []) or []:
-            act = str(ci.get("activity") or "")
-            val = safe_float(ci.get("cost_index"), 0.0)
-            if act:
-                cmap[act] = val
-        out[sid] = cmap
-    return out
+            out: Dict[int, float] = {}
+            for ci in row.get("cost_indices") or []:
+                aid = safe_int(ci.get("activity_id"), 0)
+                val = safe_float(ci.get("cost_index"), 0.0)
+                if aid:
+                    out[aid] = val
+            return out
+        return {}
+    except Exception:
+        return {}
 
 
 def fetch_market_history(region_id: int, type_id: int) -> List[Dict[str, Any]]:
+    url = f"{ESI_BASE}/markets/{region_id}/history/?datasource={ESI_DATASOURCE}&type_id={type_id}"
+    try:
+        return esi_get(url, access_token=None, timeout_s=30) or []
+    except Exception:
+        return []
+
+
+def fetch_region_orders(region_id: int, order_type: str, type_id: int) -> List[Dict[str, Any]]:
     """
-    /markets/{region_id}/history/?type_id=...
-    Returns list of daily rows.
+    Public regional orders (NPC stations only; structure orders are NOT included).
+    order_type: "buy" or "sell"
     """
-    url = esi_url(f"/markets/{region_id}/history/", type_id=type_id)
-    return http_get_json(url, timeout=ESI_TIMEOUT, retries=3, sleep_s=1.0)
-
-
-ORDERS_CACHE: Dict[Tuple[int, int, str], List[Dict[str, Any]]] = {}
-
-
-def fetch_region_orders(region_id: int, type_id: int, order_type: str, max_pages: int = ESI_MAX_PAGES_PER_TYPE) -> List[Dict[str, Any]]:
-    """
-    /markets/{region_id}/orders/?order_type=buy|sell&type_id=...&page=...
-    """
-    cache_key = (region_id, type_id, order_type)
-    cached = ORDERS_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
     orders: List[Dict[str, Any]] = []
     page = 1
     while True:
-        url = esi_url(f"/markets/{region_id}/orders/", order_type=order_type, type_id=type_id, page=page)
-        r = http_get(url, timeout=ESI_TIMEOUT, retries=3, sleep_s=1.0, stream=False)
+        url = (
+            f"{ESI_BASE}/markets/{region_id}/orders/"
+            f"?datasource={ESI_DATASOURCE}&order_type={order_type}&type_id={type_id}&page={page}"
+        )
         try:
-            data = r.json()
+            batch = esi_get(url, access_token=None, timeout_s=60)
         except Exception:
-            data = []
-        if isinstance(data, list):
-            orders.extend(data)
-        pages = safe_int(r.headers.get("X-Pages"), 1)
-        if page >= pages:
+            break
+        if not batch:
+            break
+        orders.extend(batch)
+        if len(batch) < 1000:
             break
         page += 1
-        if page > max_pages:
+        if page > 50:
             break
-        time.sleep(ESI_SLEEP_S)
-    ORDERS_CACHE[cache_key] = orders
+        time.sleep(0.12)
     return orders
+
+
+def fetch_structure_orders(structure_id: int, access_token: str) -> List[Dict[str, Any]]:
+    """
+    Authenticated structure market orders.
+    NOTE: No type filter; returns all orders, paginated.
+    """
+    orders: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        url = f"{ESI_BASE}/markets/structures/{structure_id}/?datasource={ESI_DATASOURCE}&page={page}"
+        try:
+            batch = esi_get(url, access_token=access_token, timeout_s=60)
+        except Exception:
+            break
+        if not batch:
+            break
+        orders.extend(batch)
+        if len(batch) < 1000:
+            break
+        page += 1
+        if page > 200:
+            break
+        time.sleep(0.12)
+    return orders
+
+
+# -----------------------------
+# Industry cost + fee model
+# -----------------------------
+
+@dataclass(frozen=True)
+class FeeModel:
+    sales_tax: float
+    broker_fee: float
+    facility_tax: float
+    structure_job_bonus: float  # multiplier applied to install cost, e.g. 0.98 for -2%
+
+
+def job_install_cost_per_run(
+    adjusted_prices: Dict[int, float],
+    system_cost_index: float,
+    materials: List[Dict[str, Any]],
+    output_qty: float,
+    fee: FeeModel,
+) -> float:
+    """
+    Approximate job install cost per run:
+      sum(qty * adjusted_price(material)) * system_cost_index * facility_tax * structure_job_bonus
+    """
+    if system_cost_index <= 0:
+        return 0.0
+    base = 0.0
+    for m in materials:
+        tid = safe_int(m.get("type_id"), 0)
+        qty = safe_float(m.get("qty"), 0.0)
+        ap = adjusted_prices.get(tid, 0.0)
+        if tid and qty > 0 and ap > 0:
+            base += qty * ap
+    base = base / max(output_qty, 1.0)
+    return base * system_cost_index * fee.facility_tax * fee.structure_job_bonus
+
+
+def compute_mode_metrics(
+    output_price: float,
+    output_qty: float,
+    materials: List[Dict[str, Any]],
+    time_s: float,
+    fee: FeeModel,
+    job_cost_per_run: float,
+    blueprint_cost: Optional[float],
+    blueprint_runs: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Materials: list of {type_id, name, qty, unit_price, unit_m3}
+    Returns dict with cost/revenue/fees/profit and material breakdown.
+    """
+    mat_cost = 0.0
+    mats_out: List[Dict[str, Any]] = []
+    input_m3 = 0.0
+    for m in materials:
+        qty = safe_float(m["qty"], 0.0)
+        unit_price = safe_float(m["unit_price"], 0.0)
+        unit_m3 = safe_float(m.get("unit_m3"), 0.0)
+        ext = qty * unit_price
+        mat_cost += ext
+        input_m3 += qty * unit_m3
+        mats_out.append(
+            {
+                "type_id": m["type_id"],
+                "name": m["name"],
+                "qty": qty,
+                "unit_price": unit_price,
+                "extended": ext,
+                "unit_m3": unit_m3,
+                "extended_m3": qty * unit_m3,
+            }
+        )
+
+    revenue = output_qty * output_price
+    # Market fees (selling). Buying fees ignored for simplicity.
+    sales_tax = revenue * fee.sales_tax
+    broker_fee = revenue * fee.broker_fee
+    sell_fees = sales_tax + broker_fee
+
+    # Blueprint amortization
+    bp_cost = 0.0
+    if blueprint_cost and blueprint_cost > 0:
+        runs = blueprint_runs or 1.0
+        bp_cost = blueprint_cost / max(runs, 1.0)
+
+    total_cost = mat_cost + job_cost_per_run + bp_cost + sell_fees
+    profit = revenue - total_cost
+    roi = profit / total_cost if total_cost > 0 else 0.0
+    profit_per_hour = profit / (time_s / 3600.0) if time_s > 0 else 0.0
+
+    return {
+        "cost": total_cost,
+        "materials_cost": mat_cost,
+        "job_cost": job_cost_per_run,
+        "blueprint_cost_per_run": bp_cost,
+        "revenue": revenue,
+        "fees": sell_fees,
+        "fee_breakdown": {"sales_tax": sales_tax, "broker_fee": broker_fee},
+        "profit": profit,
+        "roi": roi,
+        "profit_per_hour": profit_per_hour,
+        "materials": mats_out,
+        "input_m3_per_run": input_m3,
+    }
 
 
 # -----------------------------
 # Confidence scoring
 # -----------------------------
 
-def compute_confidence_from_stats(stats: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+def compute_confidence_from_market_stats(stats: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
     """
-    Confidence score 0-100 computed from Fuzzwork aggregate stats.
-
-    This is designed to:
-    - punish 1-order markets and wide spreads
-    - prefer thick books (orderCount + volume)
-    - punish spiky books (percentile far from min/max)
-    - punish high relative stddev
+    Confidence score (0–100) from output stats alone (buy/sell orders).
+    Conservative: penalizes low orders, low volume, high spread, high volatility.
     """
-    if not stats or "buy" not in stats or "sell" not in stats:
-        return 0, {"reason": "missing-stats"}
+    buy = (stats.get("buy") or {}) if isinstance(stats.get("buy"), dict) else {}
+    sell = (stats.get("sell") or {}) if isinstance(stats.get("sell"), dict) else {}
 
-    b = stats["buy"]
-    s = stats["sell"]
+    buy_oc = safe_int(buy.get("orderCount"), 0)
+    sell_oc = safe_int(sell.get("orderCount"), 0)
+    buy_vol = safe_float(buy.get("volume"), 0.0)
+    sell_vol = safe_float(sell.get("volume"), 0.0)
 
-    buy_max = safe_float(b.get("max"), 0.0)
-    sell_min = safe_float(s.get("min"), 0.0)
+    buy_p = safe_float(buy.get("max") or buy.get("weightedAverage") or 0.0, 0.0)
+    sell_p = safe_float(sell.get("min") or sell.get("weightedAverage") or 0.0, 0.0)
 
-    buy_orders = safe_int(b.get("orderCount"), 0)
-    sell_orders = safe_int(s.get("orderCount"), 0)
-    buy_vol = safe_float(b.get("volume"), 0.0)
-    sell_vol = safe_float(s.get("volume"), 0.0)
+    spread = max(sell_p - buy_p, 0.0)
+    spread_pct = spread / sell_p if sell_p > 0 else 1.0
 
-    spread = 1.0
-    if sell_min > 0 and buy_max > 0:
-        spread = (sell_min - buy_max) / sell_min
-        spread = max(0.0, min(spread, 1.0))
+    buy_std = safe_float(buy.get("stddev"), 0.0)
+    sell_std = safe_float(sell.get("stddev"), 0.0)
+    vol_pct = 0.0
+    if sell_p > 0:
+        vol_pct = max(buy_std, sell_std) / sell_p
 
-    # Spikiness: percentile vs min/max divergence.
-    sell_pct = safe_float(s.get("percentile"), 0.0)
-    buy_pct = safe_float(b.get("percentile"), 0.0)
-    sell_spike = 0.0
-    if sell_pct > 0 and sell_min > 0:
-        sell_spike = max(0.0, (sell_pct - sell_min) / sell_pct)
-    buy_spike = 0.0
-    if buy_pct > 0 and buy_max > 0:
-        buy_spike = max(0.0, (buy_max - buy_pct) / buy_pct)
+    score = 100.0
 
-    # Volatility proxy: stddev / weightedAverage
-    buy_wa = safe_float(b.get("weightedAverage"), 0.0)
-    sell_wa = safe_float(s.get("weightedAverage"), 0.0)
-    buy_std = safe_float(b.get("stddev"), 0.0)
-    sell_std = safe_float(s.get("stddev"), 0.0)
-    rel_vol = 0.0
-    parts = []
-    if buy_wa > 0:
-        parts.append(buy_std / buy_wa)
-    if sell_wa > 0:
-        parts.append(sell_std / sell_wa)
-    if parts:
-        rel_vol = sum(parts) / len(parts)
+    # Orders and volume
+    if buy_oc < 2:
+        score -= 35
+    elif buy_oc < 5:
+        score -= 20
+    elif buy_oc < 15:
+        score -= 10
 
-    # Normalize sub-scores.
-    # These targets are deliberately "industrialist safe" rather than trader-precise.
-    oc = (buy_orders + sell_orders) / 2.0
-    oc_score = clamp01(math.log10(oc + 1) / math.log10(200 + 1))  # 200 avg orders saturates
-    vol_score = clamp01(math.log10((buy_vol + sell_vol) / 2.0 + 1) / math.log10(1e7 + 1))  # saturate around 10M units
+    if sell_oc < 2:
+        score -= 20
+    elif sell_oc < 5:
+        score -= 10
 
-    spread_score = 1.0 - clamp01(spread / 0.08)  # 8% spread is already annoying for "press button"
-    spike_score = 1.0 - clamp01((sell_spike + buy_spike) / 2.0 / 0.20)  # 20% divergence is suspicious
-    volat_score = 1.0 - clamp01(rel_vol / 0.25)  # 25% rel stddev = unstable
+    if buy_vol < 10:
+        score -= 15
+    elif buy_vol < 100:
+        score -= 8
 
-    # Weighted blend.
-    score01 = (
-        0.28 * oc_score +
-        0.22 * vol_score +
-        0.20 * spread_score +
-        0.15 * spike_score +
-        0.15 * volat_score
-    )
-    score = int(round(100 * clamp01(score01)))
+    if sell_vol < 10:
+        score -= 10
+    elif sell_vol < 100:
+        score -= 5
 
+    # Spread and volatility
+    if spread_pct > 0.8:
+        score -= 30
+    elif spread_pct > 0.4:
+        score -= 18
+    elif spread_pct > 0.2:
+        score -= 8
+
+    if vol_pct > 1.0:
+        score -= 25
+    elif vol_pct > 0.5:
+        score -= 12
+    elif vol_pct > 0.25:
+        score -= 6
+
+    score = max(0.0, min(100.0, score))
     details = {
-        "orderCount_avg": oc,
-        "bookVolume_avg": (buy_vol + sell_vol) / 2.0,
-        "spread": spread,
-        "sell_spike": sell_spike,
-        "buy_spike": buy_spike,
-        "rel_vol": rel_vol,
-        "components": {
-            "orderCount": oc_score,
-            "bookVolume": vol_score,
-            "spread": spread_score,
-            "spike": spike_score,
-            "volatility": volat_score,
-        },
+        "buy_order_count": buy_oc,
+        "sell_order_count": sell_oc,
+        "buy_volume": buy_vol,
+        "sell_volume": sell_vol,
+        "spread_pct": spread_pct,
+        "vol_pct": vol_pct,
     }
-    return score, details
-
-
-def attach_history_liquidity(
-    confidence_details: Dict[str, Any],
-    history_rows: List[Dict[str, Any]],
-    window_days: int = 14,
-) -> None:
-    """
-    Adds history-based metrics to confidence_details if available.
-    """
-    if not history_rows:
-        return
-    # Last N days.
-    rows = history_rows[-window_days:] if len(history_rows) >= window_days else history_rows[:]
-    vols = [safe_float(r.get("volume"), 0.0) for r in rows]
-    avgs = [safe_float(r.get("average"), 0.0) for r in rows]
-    if not vols:
-        return
-    avg_daily_vol = sum(vols) / len(vols)
-    # Price volatility from history (stddev / mean)
-    mean_price = sum(avgs) / len(avgs) if avgs else 0.0
-    if mean_price > 0 and avgs:
-        var = sum((p - mean_price) ** 2 for p in avgs) / len(avgs)
-        std = math.sqrt(var)
-        hist_rel = std / mean_price
-    else:
-        hist_rel = 0.0
-
-    confidence_details["history"] = {
-        "window_days": len(rows),
-        "avg_daily_volume": avg_daily_vol,
-        "rel_volatility": hist_rel,
-    }
-
-
-def bump_confidence_with_history(base_score: int, details: Dict[str, Any]) -> int:
-    """
-    Adjust base_score using history metrics when present.
-    """
-    hist = details.get("history")
-    if not hist:
-        return base_score
-    vol = safe_float(hist.get("avg_daily_volume"), 0.0)
-    rel_vol = safe_float(hist.get("rel_volatility"), 0.0)
-
-    # Volume bonus: saturate around 2000/day for big items, but still helps for modules.
-    vol_bonus = 10.0 * clamp01(math.log10(vol + 1) / math.log10(20000 + 1))
-    # Volatility penalty: >20% is rough.
-    vol_penalty = 12.0 * clamp01(rel_vol / 0.20)
-
-    s = base_score + vol_bonus - vol_penalty
-    return int(round(max(0.0, min(100.0, s))))
+    return int(round(score)), details
 
 
 # -----------------------------
-# Depth validation (recommended runs)
+# Depth simulation (orderbook)
 # -----------------------------
 
 @dataclass
 class OrderBook:
-    best_price: float
-    orders: List[Tuple[float, int]]  # (price, volume_remain)
+    side: str  # "buy" or "sell"
+    orders: List[Tuple[float, float]]  # [(price, volume_remain)] sorted best-first
+
+    @property
+    def best(self) -> float:
+        return self.orders[0][0] if self.orders else 0.0
 
 
-def normalize_orders(orders: List[Dict[str, Any]], side: str) -> OrderBook:
-    """
-    side: 'sell' => sort asc, 'buy' => sort desc
-    """
-    rows: List[Tuple[float, int]] = []
+def build_order_book_from_esi(orders: List[Dict[str, Any]], side: str) -> OrderBook:
+    # ESI orders fields: price, volume_remain, is_buy_order, location_id
+    ob: List[Tuple[float, float]] = []
     for o in orders:
-        try:
-            price = float(o.get("price"))
-            vol = int(o.get("volume_remain") or 0)
-            if price <= 0 or vol <= 0:
-                continue
-            rows.append((price, vol))
-        except Exception:
+        p = safe_float(o.get("price"), 0.0)
+        v = safe_float(o.get("volume_remain"), 0.0)
+        if p <= 0 or v <= 0:
             continue
-    if not rows:
-        return OrderBook(best_price=0.0, orders=[])
+        ob.append((p, v))
+    # Sort best-first:
     if side == "sell":
-        rows.sort(key=lambda x: x[0])
+        ob.sort(key=lambda x: x[0])  # cheapest first
     else:
-        rows.sort(key=lambda x: -x[0])
-    best = rows[0][0]
-    return OrderBook(best_price=best, orders=rows)
+        ob.sort(key=lambda x: -x[0])  # highest first
+    return OrderBook(side=side, orders=ob)
 
 
-def max_units_with_slippage(book: OrderBook, side: str, slippage: float) -> int:
+def max_units_with_slippage(book: OrderBook, allowed_slippage: float) -> Tuple[float, float]:
     """
-    side:
-      - 'sell' means you're buying from sell orders => average <= best*(1+slippage)
-      - 'buy' means you're selling into buy orders => average >= best*(1-slippage)
+    Returns (max_units, avg_price) you can fill before average price exceeds best*(1+slippage) for sells
+    or drops below best*(1-slippage) for buys.
     """
-    if not book.orders or book.best_price <= 0:
-        return 0
-    best = book.best_price
-    if side == "sell":
-        threshold = best * (1.0 + slippage)
+    if not book.orders:
+        return 0.0, 0.0
+    best = book.best
+    if best <= 0:
+        return 0.0, 0.0
+
+    if book.side == "sell":
+        threshold = best * (1.0 + allowed_slippage)
         cmp_ok = lambda avg: avg <= threshold
     else:
-        threshold = best * (1.0 - slippage)
+        threshold = best * (1.0 - allowed_slippage)
         cmp_ok = lambda avg: avg >= threshold
 
-    total_units = 0
+    total_units = 0.0
     total_value = 0.0
-    last_ok_units = 0
+    max_ok_units = 0.0
+    max_ok_avg = 0.0
 
     for price, vol in book.orders:
-        # take full order
-        total_value += price * vol
+        if vol <= 0:
+            continue
         total_units += vol
-        avg = total_value / total_units if total_units > 0 else 0.0
+        total_value += price * vol
+        avg = total_value / total_units
         if cmp_ok(avg):
-            last_ok_units = total_units
+            max_ok_units = total_units
+            max_ok_avg = avg
         else:
             break
 
-    return int(last_ok_units)
+    return max_ok_units, max_ok_avg
 
 
-def take_units(book: OrderBook, qty: int) -> Tuple[int, float, float]:
+def take_units(book: OrderBook, units: float) -> Tuple[float, float, float]:
     """
-    Returns (filled_qty, total_value, avg_price)
+    Take up to `units` from the book (best-first).
+    Returns (filled_units, total_value, avg_price).
     """
-    if qty <= 0 or not book.orders:
-        return 0, 0.0, 0.0
-    remain = qty
-    total = 0.0
-    filled = 0
+    need = units
+    filled = 0.0
+    total_value = 0.0
     for price, vol in book.orders:
-        if remain <= 0:
+        if need <= 0:
             break
-        take = vol if vol <= remain else remain
-        total += price * take
-        filled += take
-        remain -= take
-    avg = total / filled if filled > 0 else 0.0
-    return filled, total, avg
+        dv = min(vol, need)
+        filled += dv
+        total_value += dv * price
+        need -= dv
+    avg = total_value / filled if filled > 0 else 0.0
+    return filled, total_value, avg
 
 
-def pick_depth_materials(materials: List[Dict[str, Any]], max_items: int = 6) -> List[Dict[str, Any]]:
+def fetch_orderbook_for_market(
+    market: Market,
+    order_type: str,  # "buy" or "sell"
+    type_id: int,
+    access_token: Optional[str],
+    _structure_cache: Dict[int, List[Dict[str, Any]]],
+) -> OrderBook:
     """
-    Depth validation across *every* material can explode calls.
-    We focus on the max_items inputs by per-run ISK share (extended).
+    Fetch orderbook for a single type in a market.
+    For stations/regions: use regional orders and optionally filter to station.
+    For structures: uses structure orders (cached per structure).
     """
-    if not materials:
-        return []
-    # Expect materials already have 'extended_instant' field.
-    ms = [m for m in materials if safe_float(m.get("extended_instant"), 0.0) > 0]
-    ms.sort(key=lambda m: safe_float(m.get("extended_instant"), 0.0), reverse=True)
-    return ms[:max_items]
+    if market.kind == "structure":
+        if not access_token:
+            return OrderBook(side=order_type, orders=[])
+        sid = market.structure_id or 0
+        if sid <= 0:
+            return OrderBook(side=order_type, orders=[])
+        if sid not in _structure_cache:
+            print(f"[depth] Fetching structure orders for {market.name} ({sid}) …")
+            _structure_cache[sid] = fetch_structure_orders(sid, access_token)
+        orders_all = _structure_cache[sid]
+        filtered = []
+        want_buy = (order_type == "buy")
+        for o in orders_all:
+            if safe_int(o.get("type_id"), 0) != type_id:
+                continue
+            if bool(o.get("is_buy_order")) != want_buy:
+                continue
+            filtered.append(o)
+        return build_order_book_from_esi(filtered, side=order_type)
+
+    # station / region (NPC orders)
+    if market.region_id is None:
+        return OrderBook(side=order_type, orders=[])
+    raw = fetch_region_orders(market.region_id, order_type=order_type, type_id=type_id)
+    if market.kind == "station" and market.station_id:
+        raw = [o for o in raw if safe_int(o.get("location_id"), 0) == market.station_id]
+    return build_order_book_from_esi(raw, side=order_type)
 
 
 def validate_depth_for_recipe(
-    input_region_id: int,
-    output_region_id: int,
-    output_type_id: int,
-    output_qty_per_run: float,
-    materials: List[Dict[str, Any]],
+    input_market: Market,
+    output_market: Market,
+    product_type_id: int,
+    output_qty: float,
+    materials: List[Dict[str, Any]],  # {type_id, qty, unit_price}
     input_slippage: float,
     output_slippage: float,
-    safety: float,
+    depth_safety: float,
     max_materials: int,
+    access_token: Optional[str],
+    structure_cache: Dict[int, List[Dict[str, Any]]],
 ) -> Dict[str, Any]:
     """
-    Compute recommended runs using ESI region orderbooks for output + top materials.
+    Depth validate using real orderbooks.
+    Only considers up to max_materials most expensive materials (by extended cost) for input depth.
     """
-    # Fetch output buy orders (instant sale) and sell orders (patient sale)
-    out_buy_raw = fetch_region_orders(output_region_id, output_type_id, order_type="buy")
-    time.sleep(ESI_SLEEP_S)
-    out_sell_raw = fetch_region_orders(output_region_id, output_type_id, order_type="sell")
+    # pick top materials by cost share
+    mats_sorted = sorted(
+        materials,
+        key=lambda m: safe_float(m.get("qty"), 0.0) * safe_float(m.get("unit_price"), 0.0),
+        reverse=True,
+    )
+    depth_mats = mats_sorted[: max_materials if max_materials > 0 else len(mats_sorted)]
 
-    out_buy = normalize_orders(out_buy_raw, side="buy")
-    out_sell = normalize_orders(out_sell_raw, side="sell")
-
-    # Inputs: focus on top-cost materials only (to keep ESI calls sane).
-    depth_mats = pick_depth_materials(materials, max_items=max_materials)
-    mat_books: Dict[int, OrderBook] = {}
+    max_runs_in = float("inf")
+    input_books: List[Dict[str, Any]] = []
 
     for m in depth_mats:
-        tid = int(m["type_id"])
-        raw = fetch_region_orders(input_region_id, tid, order_type="sell")
-        time.sleep(ESI_SLEEP_S)
-        mat_books[tid] = normalize_orders(raw, side="sell")
+        tid = safe_int(m.get("type_id"), 0)
+        qty_per = safe_float(m.get("qty"), 0.0)
+        if tid <= 0 or qty_per <= 0:
+            continue
+        ob = fetch_orderbook_for_market(input_market, "sell", tid, access_token, structure_cache)
+        max_units, avg = max_units_with_slippage(ob, input_slippage)
+        max_runs = math.floor(max_units / qty_per) if qty_per > 0 else 0
+        max_runs_in = min(max_runs_in, max_runs)
+        input_books.append(
+            {
+                "type_id": tid,
+                "qty_per_run": qty_per,
+                "max_units": max_units,
+                "max_runs": max_runs,
+                "avg_price_to_slippage": avg,
+                "best": ob.best,
+                "orders_considered": len(ob.orders),
+            }
+        )
 
-    # Runs by output depth (sell into buy orders).
-    max_units_out = max_units_with_slippage(out_buy, side="buy", slippage=output_slippage)
-    max_runs_output = int(max_units_out // max(1.0, output_qty_per_run))
+    if max_runs_in == float("inf"):
+        max_runs_in = 0
 
-    # Runs by input depth (buy inputs from sell orders).
-    max_runs_input = 10**9
-    limiting_input: Optional[str] = None
+    out_book = fetch_orderbook_for_market(output_market, "buy", product_type_id, access_token, structure_cache)
+    max_units_out, avg_out = max_units_with_slippage(out_book, output_slippage)
+    max_runs_out = math.floor(max_units_out / max(output_qty, 1.0))
+
+    recommended_runs = math.floor(min(max_runs_in, max_runs_out) * depth_safety)
+    recommended_runs = max(recommended_runs, 0)
+
+    # Expected numbers at recommended runs (use actual fill from orderbooks)
+    needed_out_units = recommended_runs * output_qty
+    filled_out, out_value, out_avg = take_units(out_book, needed_out_units)
+
+    needed_inputs = []
+    in_total_value = 0.0
+    in_filled_ok = True
     for m in depth_mats:
-        tid = int(m["type_id"])
-        per_run = safe_float(m.get("qty"), 0.0)
-        if per_run <= 0:
-            continue
-        book = mat_books.get(tid)
-        if not book:
-            continue
-        max_units_in = max_units_with_slippage(book, side="sell", slippage=input_slippage)
-        runs_here = int(max_units_in // per_run) if max_units_in > 0 else 0
-        if runs_here < max_runs_input:
-            max_runs_input = runs_here
-            limiting_input = m.get("name")
+        tid = safe_int(m.get("type_id"), 0)
+        qty_per = safe_float(m.get("qty"), 0.0)
+        need_units = recommended_runs * qty_per
+        ob = fetch_orderbook_for_market(input_market, "sell", tid, access_token, structure_cache)
+        filled, value, avg = take_units(ob, need_units)
+        if filled + 1e-9 < need_units:
+            in_filled_ok = False
+        in_total_value += value
+        needed_inputs.append(
+            {
+                "type_id": tid,
+                "need_units": need_units,
+                "filled_units": filled,
+                "avg_price": avg,
+            }
+        )
 
-    if max_runs_input == 10**9:
-        max_runs_input = 0
-
-    # Recommended runs
-    cap = min(max_runs_input if max_runs_input > 0 else 10**9, max_runs_output if max_runs_output > 0 else 10**9)
-    if cap == 10**9:
-        cap = 0
-    rec = int(math.floor(cap * safety)) if cap > 0 else 0
-    if rec < 1:
-        rec = 1
-
-    # Compute expected profit at rec runs using orderbooks for output and selected inputs.
-    # NOTE: For materials not depth-validated, we rely on precomputed extended cost in the ranking step.
-    # Here we recompute only for depth_mats and output to reflect slippage.
-    out_units = int(round(output_qty_per_run * rec))
-    out_filled, out_value, out_avg = take_units(out_buy, out_units)
-    out_fill_ratio = (out_filled / out_units) if out_units > 0 else 0.0
-
-    input_value = 0.0
-    input_fill_ratio = 1.0
-    input_details: Dict[str, Any] = {}
-    for m in depth_mats:
-        tid = int(m["type_id"])
-        per_run = safe_float(m.get("qty"), 0.0)
-        units = int(round(per_run * rec))
-        book = mat_books.get(tid)
-        if not book:
-            continue
-        filled, cost, avg = take_units(book, units)
-        input_value += cost
-        if units > 0:
-            input_fill_ratio = min(input_fill_ratio, filled / units)
-        input_details[str(tid)] = {"requested": units, "filled": filled, "total": cost, "avg_price": avg}
+    out_filled_ok = (filled_out + 1e-9 >= needed_out_units)
 
     return {
-        "recommended_runs": rec,
-        "max_runs_input": max_runs_input if max_runs_input > 0 else None,
-        "max_runs_output": max_runs_output if max_runs_output > 0 else None,
-        "limiting_input": limiting_input,
+        "max_runs_input": int(max_runs_in),
+        "max_runs_output": int(max_runs_out),
+        "recommended_runs": int(recommended_runs),
+        "input": {
+            "market": input_market.key,
+            "materials": input_books,
+            "filled_ok": in_filled_ok,
+            "total_value": in_total_value,
+        },
         "output": {
-            "best_buy": out_buy.best_price,
-            "best_sell": out_sell.best_price,
-            "requested": out_units,
-            "filled": out_filled,
-            "total": out_value,
+            "market": output_market.key,
+            "filled_ok": out_filled_ok,
+            "best": out_book.best,
+            "avg_price_to_slippage": avg_out,
+            "total_value": out_value,
             "avg_price": out_avg,
-            "filled_ratio": out_fill_ratio,
+            "orders_considered": len(out_book.orders),
         },
-        "inputs": {
-            "filled_ratio": input_fill_ratio,
-            "details": input_details,
+        "expected": {
+            "runs": int(recommended_runs),
+            "output_units": needed_out_units,
+            "inputs_value_depth_mats": in_total_value,
+            "output_value": out_value,
         },
-        "slippage": {"input": input_slippage, "output": output_slippage, "safety": safety},
     }
 
 
 # -----------------------------
-# Cost model
+# Skill-aware time modifiers (optional)
 # -----------------------------
 
-@dataclass
-class FeeModel:
-    sales_tax: float        # applied to revenue
-    broker_fee: float       # applied to order value when placing orders (patient)
-    facility_tax: float     # applied to job cost
-    structure_job_bonus: float  # e.g. 0.0 means none; 0.02 means 2% cheaper job cost
+def build_name_to_type_id(types: Dict[str, Any]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for tid_str, t in types.items():
+        try:
+            tid = int(tid_str)
+        except Exception:
+            continue
+        name = t.get("name")
+        if isinstance(name, str) and name:
+            # Keep first seen; skill names are unique anyway
+            out.setdefault(name, tid)
+    return out
 
 
-def job_install_cost(
-    adjusted_prices: Dict[int, Dict[str, float]],
-    mats: List[Dict[str, Any]],
-    cost_index: float,
-    fee_model: FeeModel,
-) -> float:
+def skill_level(skills_by_id: Dict[int, int], name_to_id: Dict[str, int], skill_name: str) -> int:
+    tid = name_to_id.get(skill_name)
+    if not tid:
+        return 0
+    return skills_by_id.get(tid, 0)
+
+
+def apply_time_modifiers(base_time_s: float, category: str, skill_levels: Dict[str, int]) -> float:
     """
-    Approximate job installation cost as:
-      base_value = sum(adjusted_price(material) * qty)
-      install = base_value * cost_index * (1 + facility_tax) * (1 - structure_job_bonus)
+    category: manufacturing|reactions|invention
     """
-    if cost_index <= 0:
+    t = base_time_s
+    if category in ("manufacturing", "invention", "t2"):
+        ind = skill_levels.get("Industry", 0)
+        adv = skill_levels.get("Advanced Industry", 0)
+        # Industry: -4% per level, Advanced Industry: -3% per level (best-effort; game values may change)
+        t *= (1.0 - 0.04 * ind)
+        t *= (1.0 - 0.03 * adv)
+    if category in ("reactions",):
+        rx = skill_levels.get("Reactions", 0)
+        t *= (1.0 - 0.04 * rx)
+    return max(t, 1.0)
+
+
+# -----------------------------
+# Time to liquidate (history-based)
+# -----------------------------
+
+def avg_daily_volume(history: List[Dict[str, Any]], days: int = 7) -> float:
+    # history is list of {"date": "...", "volume": ..., ...} daily bars
+    if not history:
         return 0.0
-    base = 0.0
-    for m in mats:
-        tid = int(m["type_id"])
-        qty = safe_float(m.get("qty"), 0.0)
-        if qty <= 0:
-            continue
-        adj = safe_float(adjusted_prices.get(tid, {}).get("adjusted"), 0.0)
-        if adj <= 0:
-            # fallback to average price if adjusted missing
-            adj = safe_float(adjusted_prices.get(tid, {}).get("average"), 0.0)
-        if adj <= 0:
-            continue
-        base += adj * qty
-    mult = (1.0 + fee_model.facility_tax) * (1.0 - fee_model.structure_job_bonus)
-    return base * cost_index * mult
+    # take last N entries
+    h = history[-days:]
+    vols = [safe_float(x.get("volume"), 0.0) for x in h if safe_float(x.get("volume"), 0.0) > 0]
+    if not vols:
+        return 0.0
+    return sum(vols) / len(vols)
 
 
-def compute_mode_metrics(
-    output_qty: float,
-    output_price: float,
-    mats: List[Dict[str, Any]],
-    mat_price_key: str,
-    fee_model: FeeModel,
-    include_broker_on_inputs: bool,
-    include_broker_on_outputs: bool,
-    include_sales_tax: bool,
-    job_cost_per_run: float,
-) -> Dict[str, Any]:
-    """
-    mats items must include mat_price_key and qty.
-    """
-    cost = 0.0
-    mats_out: List[Dict[str, Any]] = []
-    for m in mats:
-        qty = safe_float(m.get("qty"), 0.0)
-        p = safe_float(m.get(mat_price_key), 0.0)
-        ext = qty * p
-        cost += ext
-        mats_out.append({**m, "unit_price_used": p, "extended_used": ext})
-
-    revenue = output_qty * output_price
-    fees = 0.0
-    fee_breakdown = {}
-
-    if include_sales_tax:
-        st = revenue * fee_model.sales_tax
-        fees += st
-        fee_breakdown["sales_tax"] = st
-
-    if include_broker_on_outputs:
-        bf = revenue * fee_model.broker_fee
-        fees += bf
-        fee_breakdown["broker_sell"] = bf
-
-    if include_broker_on_inputs and cost > 0:
-        bf2 = cost * fee_model.broker_fee
-        fees += bf2
-        fee_breakdown["broker_buy"] = bf2
-
-    if job_cost_per_run > 0:
-        jc = job_cost_per_run
-        fees += jc
-        fee_breakdown["industry_install"] = jc
-
-    profit = revenue - cost - fees
-    roi = profit / cost if cost > 0 else None
-
-    return {
-        "cost": cost,
-        "revenue": revenue,
-        "fees": fees,
-        "fee_breakdown": fee_breakdown,
-        "profit": profit,
-        "roi": roi,
-        "materials": mats_out,
-        "output_price": output_price,
-    }
+def ttl_bucket(hours: float) -> str:
+    if hours <= 0 or math.isinf(hours) or math.isnan(hours):
+        return "unknown"
+    if hours <= 12:
+        return "<12h"
+    if hours <= 24:
+        return "<24h"
+    if hours <= 72:
+        return "<72h"
+    return ">72h"
 
 
 # -----------------------------
-# Main ranking computation
+# Main
 # -----------------------------
 
-def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser()
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    # Back-compat (single market mode)
+    parser.add_argument("--region-id", type=int, default=10000002, help="(legacy) region id for single-market mode")
+    parser.add_argument("--station-id", type=int, default=60003760, help="(legacy) station id for single-market mode")
 
-    ap.add_argument("--region-id", type=int, default=DEFAULT_REGION_ID)
-    ap.add_argument("--station-id", type=int, default=DEFAULT_STATION_ID)
+    # Multi-market mode
+    parser.add_argument("--markets-config", type=str, default="data/markets.json", help="Path to markets config JSON")
+    parser.add_argument("--buy-market", type=str, default=None, help="Market key to price INPUTS (materials/BPO)")
+    parser.add_argument("--sell-markets", type=str, default=None, help="Comma-separated market keys to consider for OUTPUTS")
 
-    ap.add_argument("--markets-config", default=str(MARKETS_CONFIG_PATH),
-                    help="Path to markets.json (buy market + sell market set).")
-    ap.add_argument("--buy-market", default="",
-                    help="Market key to price inputs from (overrides --region-id when found in markets config).")
-    ap.add_argument("--sell-markets", default="",
-                    help="Comma-separated market keys to consider for best sell market (defaults from markets.json).")
+    parser.add_argument("--price-mode", choices=["minmax", "percentile", "weighted"], default="percentile")
+    parser.add_argument("--pricing-scope", choices=["region", "station"], default="station")
 
+    parser.add_argument("--min-output-buy-orders", type=int, default=3)
+    parser.add_argument("--min-blueprint-sell-orders", type=int, default=1)
+    parser.add_argument("--min-job-time-s", type=int, default=600)
+    parser.add_argument("--max-rows", type=int, default=400)
 
-    ap.add_argument("--price-mode", choices=["minmax", "percentile", "weighted"], default="percentile",
-                    help="How to select prices from aggregates. percentile is safest.")
-    ap.add_argument("--pricing-scope", choices=["region", "station"], default="region",
-                    help="Baseline pricing scope. Refining will still default to region to avoid blank outputs.")
+    # Refining liquidity thresholds (separate)
+    parser.add_argument("--min-ref-input-sell-orders", type=int, default=5)
+    parser.add_argument("--min-ref-output-buy-orders", type=int, default=3)
 
-    # Filtering
-    ap.add_argument("--min-output-buy-orders", type=int, default=10)
-    ap.add_argument("--min-blueprint-sell-orders", type=int, default=1)
-    ap.add_argument("--min-job-time-s", type=int, default=60)
-    ap.add_argument("--max-rows", type=int, default=500, help="Max rows per category in output (after sorting)")
+    # Confidence + depth validation
+    parser.add_argument("--confidence-history", action="store_true", help="Use ESI market history to bump confidence / TTL")
+    parser.add_argument("--depth-top-n", type=int, default=80)
+    parser.add_argument("--depth-max-materials", type=int, default=8)
+    parser.add_argument("--input-slippage", type=float, default=0.03)
+    parser.add_argument("--output-slippage", type=float, default=0.03)
+    parser.add_argument("--depth-safety", type=float, default=0.85)
+    parser.add_argument("--best-min-confidence", type=int, default=50, help="When choosing best sell market, ignore markets below this confidence")
 
-    # Refining filtering
-    ap.add_argument("--min-ref-input-sell-orders", type=int, default=5)
-    ap.add_argument("--min-ref-output-buy-orders", type=int, default=3)
+    # Fees / costs
+    parser.add_argument("--sales-tax", type=float, default=0.036)      # ~3.6% (example; adjust)
+    parser.add_argument("--broker-fee", type=float, default=0.03)      # ~3.0% (example; adjust)
+    parser.add_argument("--facility-tax", type=float, default=1.0)     # multiplier on job install cost
+    parser.add_argument("--structure-job-bonus", type=float, default=1.0)  # multiplier on job install cost
 
-    # Confidence
-    ap.add_argument("--confidence-history", action="store_true",
-                    help="Augment confidence with ESI market history for top candidates (extra API calls).")
+    # Build locations (for system cost indices)
+    parser.add_argument("--mfg-system-id", type=int, default=30000142, help="System where you manufacture (for cost index)")
+    parser.add_argument("--rx-system-id", type=int, default=30000142, help="System where you run reactions (for cost index)")
+    parser.add_argument("--inv-system-id", type=int, default=30000142, help="System where you invent (for cost index)")
 
-    # Depth validation
-    ap.add_argument("--depth-top-n", type=int, default=25, help="Top N per category to validate with ESI orderbooks")
-    ap.add_argument("--depth-max-materials", type=int, default=6, help="Max materials per recipe to depth-validate")
-    ap.add_argument("--input-slippage", type=float, default=0.05)
-    ap.add_argument("--output-slippage", type=float, default=0.05)
-    ap.add_argument("--depth-safety", type=float, default=0.80)
+    parser.add_argument("--force-recipes", action="store_true")
+    parser.add_argument("--out", type=str, default=str(OUT_PATH_DEFAULT))
 
-    # Taxes / costs
-    ap.add_argument("--sales-tax", type=float, default=0.03375, help="Sales tax rate (Accounting V ~3.375%%)")
-    ap.add_argument("--broker-fee", type=float, default=0.01, help="Broker fee rate (varies by skills/standings)")
-    ap.add_argument("--facility-tax", type=float, default=0.0, help="Structure facility tax applied to job install")
-    ap.add_argument("--structure-job-bonus", type=float, default=0.0, help="Job cost reduction from rigs (e.g. 0.02)")
-    ap.add_argument("--mfg-system-id", type=int, default=DEFAULT_SYSTEM_ID)
-    ap.add_argument("--rx-system-id", type=int, default=DEFAULT_SYSTEM_ID)
-    ap.add_argument("--inv-system-id", type=int, default=DEFAULT_SYSTEM_ID)
+    args = parser.parse_args()
 
-    ap.add_argument("--force-recipes", action="store_true", help="Rebuild recipes.json.gz")
-    ap.add_argument("--out", default=str(RANKINGS_PATH))
+    # Build recipes if needed
+    maybe_build_recipes(force=args.force_recipes)
+    recipes, types = load_recipes()
+    name_to_tid = build_name_to_type_id(types)
 
-    args = ap.parse_args(argv)
-    # ---- Market configuration (buy market + sell markets) ----
-    markets_cfg = load_markets_config(Path(args.markets_config))
-    markets_list = markets_cfg.get("markets") or DEFAULT_MARKETS
+    # SSO (optional)
+    access_token = None
+    character: Dict[str, Any] = {}
+    sso_client_id = os.environ.get("EVE_SSO_CLIENT_ID")
+    sso_client_secret = os.environ.get("EVE_SSO_CLIENT_SECRET")
+    sso_refresh = os.environ.get("EVE_SSO_REFRESH_TOKEN")
+    if sso_client_id and sso_client_secret and sso_refresh:
+        access_token = sso_access_token_from_refresh(sso_client_id, sso_client_secret, sso_refresh)
+        if access_token:
+            cid, cname = fetch_character_id_and_name(access_token)
+            if cid and cname:
+                skills_by_id = fetch_character_skills(access_token, cid)
+                # Store a small human-friendly subset (best effort)
+                skill_levels = {
+                    "Industry": skill_level(skills_by_id, name_to_tid, "Industry"),
+                    "Advanced Industry": skill_level(skills_by_id, name_to_tid, "Advanced Industry"),
+                    "Reactions": skill_level(skills_by_id, name_to_tid, "Reactions"),
+                }
+                character = {"id": cid, "name": cname, "skills": skill_levels}
+            else:
+                character = {"id": None, "name": None}
 
-    # Merge defaults so core hubs always exist
-    market_by_key: Dict[str, Dict[str, Any]] = {}
-    for mkt in DEFAULT_MARKETS:
-        if isinstance(mkt, dict) and mkt.get("key"):
-            market_by_key[str(mkt["key"])] = mkt
-    for mkt in markets_list:
-        if isinstance(mkt, dict) and mkt.get("key"):
-            market_by_key[str(mkt["key"])] = mkt
+    # Markets configuration
+    markets_path = Path(args.markets_config)
+    if markets_path.exists():
+        cfg = load_markets_config(markets_path)
+    else:
+        # fallback: legacy single-market config
+        cfg = MarketsConfig(
+            markets={
+                "legacy": Market(
+                    key="legacy",
+                    name=f"Region {args.region_id}",
+                    kind="station" if args.pricing_scope == "station" else "region",
+                    region_id=args.region_id,
+                    station_id=args.station_id if args.pricing_scope == "station" else None,
+                )
+            },
+            default_buy="legacy",
+            default_sells=["legacy"],
+        )
 
-    buy_market_key = (args.buy_market or markets_cfg.get("buy_market") or DEFAULT_BUY_MARKET).strip()
-    if buy_market_key not in market_by_key:
-        print(f"[update_rankings] Unknown buy market '{buy_market_key}', falling back to {DEFAULT_BUY_MARKET}")
-        buy_market_key = DEFAULT_BUY_MARKET
-    buy_market = market_by_key[buy_market_key]
-    buy_region_id = safe_int(buy_market.get("region_id"), args.region_id)
-    buy_station_id = safe_int(buy_market.get("station_id"), args.station_id)
+    buy_key = args.buy_market or cfg.default_buy
+    sell_keys = parse_csv_list(args.sell_markets) or cfg.default_sells or [buy_key]
 
-    sell_markets_raw = (args.sell_markets or "").strip()
-    if not sell_markets_raw:
-        sell_markets_raw = ",".join(markets_cfg.get("sell_markets") or DEFAULT_SELL_MARKETS)
-    sell_market_keys = [s.strip() for s in sell_markets_raw.split(",") if s.strip()]
-    sell_market_keys = [k for k in sell_market_keys if k in market_by_key]
-    if not sell_market_keys:
-        sell_market_keys = DEFAULT_SELL_MARKETS[:]
-    if buy_market_key not in sell_market_keys:
-        sell_market_keys.insert(0, buy_market_key)
+    # sanitize keys
+    if buy_key not in cfg.markets:
+        raise SystemExit(f"Unknown buy market key: {buy_key}")
+    sell_keys = [k for k in sell_keys if k in cfg.markets and k != ""]
+    if not sell_keys:
+        sell_keys = [buy_key]
 
-    # Back-compat vars (the rest of the script historically assumes a single region/station):
-    region_id = buy_region_id
-    station_id = buy_station_id
+    buy_market = cfg.markets[buy_key]
+    sell_markets = [cfg.markets[k] for k in sell_keys]
 
-    maybe_build_recipes(RECIPES_PATH, force=args.force_recipes)
-    recipes = load_recipes(RECIPES_PATH)
+    # Drop invalid markets (e.g. structure markets without structure_id)
+    sell_markets = [m for m in sell_markets if m.is_valid()]
+    if not sell_markets:
+        sell_markets = [buy_market] if buy_market.is_valid() else []
 
-    types: Dict[int, Dict[str, Any]] = {int(k): v for k, v in (recipes.get("types") or {}).items()}
+    if not buy_market.is_valid():
+        # In the worst case, fall back to legacy region
+        buy_market = Market(key="legacy", name=f"Region {args.region_id}", kind="region", region_id=args.region_id)
 
-    # Load market aggregates (region scope baseline) for *all* regions we need:
-    region_ids_needed: Set[int] = {region_id}
-    for mk in sell_market_keys:
-        rid = safe_int(market_by_key.get(mk, {}).get("region_id"), 0)
-        if rid > 0:
-            region_ids_needed.add(rid)
+    print(f"[markets] Buy market: {buy_market.key} ({buy_market.name})")
+    print("[markets] Sell markets:", ", ".join(f"{m.key}({m.name})" for m in sell_markets))
 
-    region_stats_by_region, agg_headers = load_multi_region_prices_from_aggregatecsv(AGG_CSV_CACHE, region_ids_needed)
-    region_stats = region_stats_by_region.get(region_id, {})
+    # Build type id sets needed for pricing
+    mfg_recipes = recipes.get("manufacturing") or []
+    rx_recipes = recipes.get("reactions") or []
+    ref_recipes = recipes.get("refining") or []
+    inv_recipes = recipes.get("invention") or []
 
-    # NOTE: station pricing-scope is still intentionally omitted in this bundle, because
-    # station-level aggregates (Jita 4-4 only) will *miss* structure market activity.
-    # Using region + robust percentile is the safer default.
-    pricing_scope = args.pricing_scope
-    stats = region_stats  # legacy alias (buy region)
+    buy_type_ids: Set[int] = set()
+    sell_type_ids: Set[int] = set()
 
+    # Manufacturing / reactions inputs and blueprints from buy market; outputs from sell markets
+    for r in mfg_recipes:
+        buy_type_ids.add(safe_int(r.get("blueprint_type_id"), 0))
+        sell_type_ids.add(safe_int(r.get("product_type_id"), 0))
+        for m in r.get("materials") or []:
+            buy_type_ids.add(safe_int(m.get("type_id"), 0))
 
-    # Optional: load authenticated structure-market stats (null-sec hubs, private citadels, etc.)
-    structure_stats_by_market: Dict[str, Dict[int, Dict[str, Any]]] = {}
-    structure_market_keys = [
-        k
-        for k in sell_market_keys
-        if (market_by_key.get(k) or {}).get("kind") == "structure"
-        and safe_int((market_by_key.get(k) or {}).get("structure_id"), 0) > 0
-    ]
+    for r in rx_recipes:
+        buy_type_ids.add(safe_int(r.get("blueprint_type_id"), 0))
+        sell_type_ids.add(safe_int(r.get("product_type_id"), 0))
+        for m in r.get("materials") or []:
+            buy_type_ids.add(safe_int(m.get("type_id"), 0))
 
-    if structure_market_keys:
-        token = get_sso_access_token_from_env()
-        if not token:
-            print("[update_rankings] Structure markets configured but no EVE SSO token provided; skipping structure markets.")
-        else:
-            for mk in structure_market_keys:
-                sid = safe_int((market_by_key.get(mk) or {}).get("structure_id"), 0)
-                if sid <= 0:
+    # Refining: ore/ice inputs from buy market, mineral outputs valued in sell markets
+    for r in ref_recipes:
+        buy_type_ids.add(safe_int(r.get("input_type_id"), 0))
+        for o in r.get("outputs") or []:
+            sell_type_ids.add(safe_int(o.get("type_id"), 0))
+
+    # Invention: datacores/decryptors and T2 build inputs are bought in buy market; outputs sold in sell markets
+    for r in inv_recipes:
+        # invention consumes these
+        for m in r.get("invention_materials") or []:
+            buy_type_ids.add(safe_int(m.get("type_id"), 0))
+        # produced blueprint then manufactured; revenue from final product
+        sell_type_ids.add(safe_int(r.get("product_type_id"), 0))
+        # and manufacturing materials for the T2 product if embedded
+        for m in r.get("manufacturing_materials") or []:
+            buy_type_ids.add(safe_int(m.get("type_id"), 0))
+
+    buy_type_ids.discard(0)
+    sell_type_ids.discard(0)
+
+    # Load pricing for buy market and sell markets
+    market_prices: Dict[str, Dict[int, Dict[str, Any]]] = {}
+
+    # Station scope: use station aggregates for station markets; Region scope: aggregatecsv.
+    # We always load at least buy market.
+    def load_market_prices_for(market: Market, needed: Set[int]) -> Dict[int, Dict[str, Any]]:
+        needed_list = sorted(needed)
+        if market.kind == "station" and args.pricing_scope == "station" and market.station_id:
+            return fetch_fuzzwork_station_aggregates(market.station_id, needed_list)
+        if market.kind == "region" or args.pricing_scope == "region":
+            rid = market.region_id or args.region_id
+            regions = {rid}
+            prices_by_region = load_region_prices_from_aggregatecsv(CACHE_DIR / "aggregatecsv.csv", regions, type_filter=needed)
+            return prices_by_region.get(rid, {})
+        # structure: we'll compute stats from structure orders if token is available
+        if market.kind == "structure" and market.structure_id and access_token:
+            orders = fetch_structure_orders(market.structure_id, access_token)
+            by_type_buy: Dict[int, List[Dict[str, Any]]] = {}
+            by_type_sell: Dict[int, List[Dict[str, Any]]] = {}
+            for o in orders:
+                tid = safe_int(o.get("type_id"), 0)
+                if tid not in needed:
                     continue
-                try:
-                    print(f"[update_rankings] Fetching structure market orders for {mk} (structure_id={sid})")
-                    orders = fetch_structure_orders(sid, token)
-                    structure_stats_by_market[mk] = build_stats_from_orders(orders)
-                except Exception as e:
-                    print(f"[update_rankings] Failed to fetch structure market {mk}: {e}")
+                if bool(o.get("is_buy_order")):
+                    by_type_buy.setdefault(tid, []).append(o)
+                else:
+                    by_type_sell.setdefault(tid, []).append(o)
+            stats: Dict[int, Dict[str, Any]] = {}
+            for tid in needed:
+                b = by_type_buy.get(tid, [])
+                s = by_type_sell.get(tid, [])
+                # sort for percentile correctness
+                b_sorted = sorted(b, key=lambda x: -safe_float(x.get("price"), 0.0))
+                s_sorted = sorted(s, key=lambda x: safe_float(x.get("price"), 0.0))
+                stats[tid] = {
+                    "buy": compute_stats_from_orders(
+                        [{"price": o.get("price"), "volume_remain": o.get("volume_remain")} for o in b_sorted]
+                    ),
+                    "sell": compute_stats_from_orders(
+                        [{"price": o.get("price"), "volume_remain": o.get("volume_remain")} for o in s_sorted]
+                    ),
+                }
+            return stats
+        return {}
 
-    def market_stats(mk: str, tid: int) -> Dict[str, Any]:
-        mkt = market_by_key.get(mk) or {}
-        kind = (mkt.get("kind") or "station").lower()
-        if kind == "structure":
-            return (structure_stats_by_market.get(mk) or {}).get(tid, {})
-        rid = safe_int(mkt.get("region_id"), 0)
-        if rid <= 0:
-            return {}
-        return (region_stats_by_region.get(rid) or {}).get(tid, {})
+    # buy market needs buy_type_ids (and may also be a sell market)
+    market_prices[buy_market.key] = load_market_prices_for(buy_market, buy_type_ids.union(sell_type_ids if buy_market in sell_markets else set()))
 
-    def market_price(mk: str, tid: int, side: str) -> float:
-        return fuzz_price(market_stats(mk, tid), side=side, mode=args.price_mode)
+    # sell markets need only sell_type_ids (plus maybe blueprint? not needed)
+    for m in sell_markets:
+        if m.key == buy_market.key:
+            continue
+        market_prices[m.key] = load_market_prices_for(m, sell_type_ids)
 
-    def market_order_count(mk: str, tid: int, side: str) -> int:
-        s = market_stats(mk, tid).get(side) or {}
-        return safe_int(s.get("orderCount"), 0)
-
-
-    # Load ESI adjusted prices and system cost indices (for job install)
-    print("[update_rankings] Fetching ESI adjusted prices and cost indices…")
+    # ESI adjusted prices + system cost indices
     adjusted_prices = fetch_adjusted_prices()
-    sys_indices = fetch_system_cost_indices()
-
-    mfg_cost_index = safe_float(sys_indices.get(args.mfg_system_id, {}).get("manufacturing"), 0.0)
-    rx_cost_index = safe_float(sys_indices.get(args.rx_system_id, {}).get("reaction"), 0.0)
-    inv_cost_index = safe_float(sys_indices.get(args.inv_system_id, {}).get("invention"), 0.0)
+    mfg_ci = fetch_system_cost_indices(args.mfg_system_id).get(1, 0.0)
+    rx_ci = fetch_system_cost_indices(args.rx_system_id).get(11, 0.0)
+    inv_ci = fetch_system_cost_indices(args.inv_system_id).get(8, 0.0)
 
     fee_model = FeeModel(
         sales_tax=args.sales_tax,
@@ -1304,943 +1316,733 @@ def main(argv: Optional[List[str]] = None) -> int:
         structure_job_bonus=args.structure_job_bonus,
     )
 
-        # Helper: get stats for a type
-    def tstats(tid: int, rid: Optional[int] = None) -> Dict[str, Any]:
-        rr = region_stats_by_region.get(int(rid) if rid else region_id, {})
-        return rr.get(tid, {})
+    # Helper functions for type names & volume
+    def tname(tid: int) -> str:
+        return (types.get(str(tid)) or {}).get("name") or f"type:{tid}"
 
-    def price(tid: int, side: str, rid: Optional[int] = None) -> float:
-        return fuzz_price(tstats(tid, rid=rid), side=side, mode=args.price_mode)
+    def tvol(tid: int) -> float:
+        return safe_float((types.get(str(tid)) or {}).get("volume"), 0.0)
 
-    def order_count(tid: int, side: str, rid: Optional[int] = None) -> int:
-        s = tstats(tid, rid=rid).get(side) or {}
-        return safe_int(s.get("orderCount"), 0)
+    def stats_for(market_key: str, tid: int) -> Dict[str, Any]:
+        return market_prices.get(market_key, {}).get(tid, {})
 
-    def best_sell_market(tid: int, side: str, min_orders: int) -> Tuple[Optional[str], float]:
-        """Returns (market_key, price) for the best market among sell_market_keys."""
-        best_key: Optional[str] = None
-        best_p: float = 0.0
-        for mk in sell_market_keys:
-            rid = safe_int(market_by_key.get(mk, {}).get("region_id"), 0)
-            if rid <= 0:
-                continue
-            if order_count(tid, side, rid=rid) < min_orders:
-                continue
-            p = price(tid, side, rid=rid)
-            if p > best_p:
-                best_p = p
-                best_key = mk
-        return best_key, best_p
+    def price_for(market_key: str, tid: int, side: str) -> float:
+        return fuzz_price(stats_for(market_key, tid), side, args.price_mode)
 
-# Compute manufacturing rows
-    print("[update_rankings] Computing manufacturing rankings…")
+    def summarize_alternatives(per_market: Dict[str, Any], mode: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """Small, JSON-friendly summary of best destinations by mode."""
+        items = sorted(
+            per_market.items(),
+            key=lambda kv: safe_float((kv[1].get(mode) or {}).get("profit_per_hour"), 0.0),
+            reverse=True,
+        )
+        out: List[Dict[str, Any]] = []
+        for k, v in items[:top_k]:
+            m = v.get(mode) or {}
+            out.append(
+                {
+                    "market": k,
+                    "market_name": v.get("market_name") or k,
+                    "profit_per_hour": safe_float(m.get("profit_per_hour"), 0.0),
+                    "profit": safe_float(m.get("profit"), 0.0),
+                    "roi": safe_float(m.get("roi"), 0.0),
+                    "confidence": safe_int(v.get("confidence"), 0),
+                }
+            )
+        return out
+
+
+    # -----------------------------
+    # Build rows
+    # -----------------------------
+
     manufacturing_rows: List[Dict[str, Any]] = []
-    for r in recipes.get("manufacturing") or []:
-        bp_tid = safe_int(r.get("blueprint_type_id"), 0)
-        prod_tid = safe_int(r.get("product_type_id"), 0)
-        time_s = safe_int(r.get("time_s"), 0)
-        out_qty = safe_float(r.get("output_qty"), 1.0)
-        if bp_tid <= 0 or prod_tid <= 0:
-            continue
-        if time_s < args.min_job_time_s:
-            continue
-
-        # Blueprint must be purchasable (avoid limited editions / dead BPOs)
-        bp_sell_orders = order_count(bp_tid, "sell")
-        bp_cost = price(bp_tid, "sell")
-        if bp_sell_orders < args.min_blueprint_sell_orders or bp_cost <= 0:
-            continue
-
-        # Output must be sellable in at least one of the configured sell markets.
-        # Instant mode: sell to buy orders -> use the best buy price among sell_market_keys.
-        out_buy_by_market: Dict[str, float] = {}
-        out_sell_by_market: Dict[str, float] = {}
-        out_buy_orders_by_market: Dict[str, int] = {}
-        out_sell_orders_by_market: Dict[str, int] = {}
-
-        best_buy_market: Optional[str] = None
-        best_buy_price: float = 0.0
-        best_sell_market_key: Optional[str] = None
-        best_sell_price: float = 0.0
-
-        for mk in sell_market_keys:
-            pb = market_price(mk, prod_tid, "buy")
-            ps = market_price(mk, prod_tid, "sell")
-            ob = market_order_count(mk, prod_tid, "buy")
-            os_ = market_order_count(mk, prod_tid, "sell")
-            if pb <= 0 and ps <= 0 and ob <= 0 and os_ <= 0:
-                continue
-            out_buy_by_market[mk] = pb
-            out_sell_by_market[mk] = ps
-            out_buy_orders_by_market[mk] = ob
-            out_sell_orders_by_market[mk] = os_
-            if ob >= args.min_output_buy_orders and pb > best_buy_price:
-                best_buy_price = pb
-                best_buy_market = mk
-            if os_ > 0 and ps > best_sell_price:
-                best_sell_price = ps
-                best_sell_market_key = mk
-
-        if not best_buy_market or best_buy_price <= 0:
-            continue
-
-        if not best_sell_market_key or best_sell_price <= 0:
-            best_sell_market_key = best_buy_market
-            best_sell_price = out_sell_by_market.get(best_sell_market_key) or 0.0
-
-        out_buy = best_buy_price
-        out_sell = best_sell_price
-        out_buy_market = best_buy_market
-        out_sell_market = best_sell_market_key
-        out_buy_region_id = safe_int(market_by_key.get(out_buy_market, {}).get("region_id"), 0)
-        out_sell_region_id = safe_int(market_by_key.get(out_sell_market, {}).get("region_id"), 0)
-        out_buy_structure_id = safe_int(market_by_key.get(out_buy_market, {}).get("structure_id"), 0)
-        out_sell_structure_id = safe_int(market_by_key.get(out_sell_market, {}).get("structure_id"), 0)
-        out_buy_market_kind = (market_by_key.get(out_buy_market, {}).get("kind") or "station")
-        out_sell_market_kind = (market_by_key.get(out_sell_market, {}).get("kind") or "station")
-
-
-        mats = r.get("materials") or []
-        # Attach both sell/buy unit prices so the UI can toggle modes later
-        mats2: List[Dict[str, Any]] = []
-        missing = False
-        for m in mats:
-            mt = safe_int(m.get("type_id"), 0)
-            qty = safe_float(m.get("qty"), 0.0)
-            if mt <= 0 or qty <= 0:
-                continue
-            sellp = price(mt, "sell")
-            buyp = price(mt, "buy")
-            if sellp <= 0 or buyp <= 0:
-                # If either side missing, we can still compute instant mode if sell exists;
-                # but patient mode will be incomplete. Keep if sell exists.
-                if sellp <= 0:
-                    missing = True
-                    break
-            mats2.append({
-                "type_id": mt,
-                "name": m.get("name") or types.get(mt, {}).get("name", f"type {mt}"),
-                "qty": qty,
-                "unit_price_sell": sellp if sellp > 0 else None,
-                "unit_price_buy": buyp if buyp > 0 else None,
-            })
-        if missing or not mats2:
-            continue
-
-        # Precompute extended instant for depth material selection
-        for m in mats2:
-            m["extended_instant"] = safe_float(m.get("qty"), 0.0) * safe_float(m.get("unit_price_sell"), 0.0)
-
-
-        job_cost = job_install_cost(adjusted_prices, mats2, mfg_cost_index, fee_model)
-
-        instant = compute_mode_metrics(
-            output_qty=out_qty,
-            output_price=out_buy,
-            mats=mats2,
-            mat_price_key="unit_price_sell",
-            fee_model=fee_model,
-            include_broker_on_inputs=False,
-            include_broker_on_outputs=False,
-            include_sales_tax=True,
-            job_cost_per_run=job_cost,
-        )
-        patient = compute_mode_metrics(
-            output_qty=out_qty,
-            output_price=out_sell,
-            mats=mats2,
-            mat_price_key="unit_price_buy",
-            fee_model=fee_model,
-            include_broker_on_inputs=True,
-            include_broker_on_outputs=True,
-            include_sales_tax=True,
-            job_cost_per_run=job_cost,
-        )
-
-        # Confidence for the output market
-        c0, c_details = compute_confidence_from_stats(market_stats(out_buy_market, prod_tid))
-        confidence = c0
-        if args.confidence_history:
-            # We only fetch history later for top candidates (to avoid huge API spam)
-            pass
-
-        profit_per_hour = instant["profit"] / (time_s / 3600) if time_s > 0 else None
-
-        payback_runs = None
-        if bp_cost > 0 and instant["profit"] > 0:
-            payback_runs = bp_cost / instant["profit"]
-
-        manufacturing_rows.append({
-            "category": "manufacturing",
-            "blueprint_type_id": bp_tid,
-            "blueprint_name": r.get("blueprint_name") or types.get(bp_tid, {}).get("name", f"type {bp_tid}"),
-            "product_type_id": prod_tid,
-            "product_name": r.get("product_name") or types.get(prod_tid, {}).get("name", f"type {prod_tid}"),
-            "output_qty": out_qty,
-            "time_s": time_s,
-            "buy_market": buy_market_key,
-            "sell_instant_market": out_buy_market,
-            "sell_instant_market_name": (market_by_key.get(out_buy_market) or {}).get("name") or out_buy_market,
-            "sell_instant_kind": out_buy_market_kind,
-            "sell_instant_region_id": out_buy_region_id,
-            "sell_instant_structure_id": out_buy_structure_id,
-            "sell_patient_market": out_sell_market,
-            "sell_patient_market_name": (market_by_key.get(out_sell_market) or {}).get("name") or out_sell_market,
-            "sell_patient_kind": out_sell_market_kind,
-            "sell_patient_region_id": out_sell_region_id,
-            "sell_patient_structure_id": out_sell_structure_id,
-            "sell_markets_considered": sell_market_keys,
-            "output_buy_by_market": out_buy_by_market,
-            "output_sell_by_market": out_sell_by_market,
-            "output_buy_orders_by_market": out_buy_orders_by_market,
-            "output_sell_orders_by_market": out_sell_orders_by_market,
-            "blueprint_cost": bp_cost,
-            "blueprint_sell_orders": bp_sell_orders,
-            "confidence": confidence,
-            "confidence_details": c_details,
-            "instant": instant,
-            "patient": patient,
-            # convenience fields for existing UI
-            "profit": instant["profit"],
-            "profit_per_hour": profit_per_hour,
-            "roi": instant["roi"],
-            "cost": instant["cost"],
-            "revenue": instant["revenue"],
-            "fees": instant["fees"],
-            "materials": instant["materials"],
-            "payback_runs": payback_runs,
-            "depth": None,
-        })
-
-    # Reactions
-    print("[update_rankings] Computing reaction rankings…")
     reaction_rows: List[Dict[str, Any]] = []
-    for r in recipes.get("reactions") or []:
-        bp_tid = safe_int(r.get("blueprint_type_id"), 0)
-        prod_tid = safe_int(r.get("product_type_id"), 0)
-        time_s = safe_int(r.get("time_s"), 0)
-        out_qty = safe_float(r.get("output_qty"), 1.0)
-        if bp_tid <= 0 or prod_tid <= 0:
-            continue
-        if time_s < args.min_job_time_s:
-            continue
-
-        # Formula must be purchasable
-        bp_sell_orders = order_count(bp_tid, "sell")
-        bp_cost = price(bp_tid, "sell")
-        if bp_sell_orders < args.min_blueprint_sell_orders or bp_cost <= 0:
-            continue
-
-        # Output must be sellable in at least one of the configured sell markets.
-        out_buy_by_market: Dict[str, float] = {}
-        out_sell_by_market: Dict[str, float] = {}
-        out_buy_orders_by_market: Dict[str, int] = {}
-        out_sell_orders_by_market: Dict[str, int] = {}
-
-        best_buy_market: Optional[str] = None
-        best_buy_price: float = 0.0
-        best_sell_market_key: Optional[str] = None
-        best_sell_price: float = 0.0
-
-        for mk in sell_market_keys:
-            pb = market_price(mk, prod_tid, "buy")
-            ps = market_price(mk, prod_tid, "sell")
-            ob = market_order_count(mk, prod_tid, "buy")
-            os_ = market_order_count(mk, prod_tid, "sell")
-            if pb <= 0 and ps <= 0 and ob <= 0 and os_ <= 0:
-                continue
-            out_buy_by_market[mk] = pb
-            out_sell_by_market[mk] = ps
-            out_buy_orders_by_market[mk] = ob
-            out_sell_orders_by_market[mk] = os_
-            if ob >= args.min_output_buy_orders and pb > best_buy_price:
-                best_buy_price = pb
-                best_buy_market = mk
-            if os_ > 0 and ps > best_sell_price:
-                best_sell_price = ps
-                best_sell_market_key = mk
-
-        if not best_buy_market or best_buy_price <= 0:
-            continue
-
-        if not best_sell_market_key or best_sell_price <= 0:
-            best_sell_market_key = best_buy_market
-            best_sell_price = out_sell_by_market.get(best_sell_market_key) or 0.0
-
-        out_buy = best_buy_price
-        out_sell = best_sell_price
-        out_buy_market = best_buy_market
-        out_sell_market = best_sell_market_key
-        out_buy_region_id = safe_int(market_by_key.get(out_buy_market, {}).get("region_id"), 0)
-        out_sell_region_id = safe_int(market_by_key.get(out_sell_market, {}).get("region_id"), 0)
-        out_buy_structure_id = safe_int(market_by_key.get(out_buy_market, {}).get("structure_id"), 0)
-        out_sell_structure_id = safe_int(market_by_key.get(out_sell_market, {}).get("structure_id"), 0)
-        out_buy_market_kind = (market_by_key.get(out_buy_market, {}).get("kind") or "station")
-        out_sell_market_kind = (market_by_key.get(out_sell_market, {}).get("kind") or "station")
-
-
-        mats = r.get("materials") or []
-        mats2: List[Dict[str, Any]] = []
-        missing = False
-        for m in mats:
-            mt = safe_int(m.get("type_id"), 0)
-            qty = safe_float(m.get("qty"), 0.0)
-            if mt <= 0 or qty <= 0:
-                continue
-            sellp = price(mt, "sell")
-            buyp = price(mt, "buy")
-            if sellp <= 0:
-                missing = True
-                break
-            mats2.append({
-                "type_id": mt,
-                "name": m.get("name") or types.get(mt, {}).get("name", f"type {mt}"),
-                "qty": qty,
-                "unit_price_sell": sellp if sellp > 0 else None,
-                "unit_price_buy": buyp if buyp > 0 else None,
-            })
-        if missing or not mats2:
-            continue
-
-        for m in mats2:
-            m["extended_instant"] = safe_float(m.get("qty"), 0.0) * safe_float(m.get("unit_price_sell"), 0.0)
-
-
-        job_cost = job_install_cost(adjusted_prices, mats2, rx_cost_index, fee_model)
-
-        instant = compute_mode_metrics(
-            output_qty=out_qty,
-            output_price=out_buy,
-            mats=mats2,
-            mat_price_key="unit_price_sell",
-            fee_model=fee_model,
-            include_broker_on_inputs=False,
-            include_broker_on_outputs=False,
-            include_sales_tax=True,
-            job_cost_per_run=job_cost,
-        )
-        patient = compute_mode_metrics(
-            output_qty=out_qty,
-            output_price=out_sell,
-            mats=mats2,
-            mat_price_key="unit_price_buy",
-            fee_model=fee_model,
-            include_broker_on_inputs=True,
-            include_broker_on_outputs=True,
-            include_sales_tax=True,
-            job_cost_per_run=job_cost,
-        )
-
-        c0, c_details = compute_confidence_from_stats(market_stats(out_buy_market, prod_tid))
-        confidence = c0
-
-        profit_per_hour = instant["profit"] / (time_s / 3600) if time_s > 0 else None
-
-        reaction_rows.append({
-            "category": "reactions",
-            "blueprint_type_id": bp_tid,
-            "blueprint_name": r.get("blueprint_name") or types.get(bp_tid, {}).get("name", f"type {bp_tid}"),
-            "product_type_id": prod_tid,
-            "product_name": r.get("product_name") or types.get(prod_tid, {}).get("name", f"type {prod_tid}"),
-            "output_qty": out_qty,
-            "time_s": time_s,
-            "buy_market": buy_market_key,
-            "sell_instant_market": out_buy_market,
-            "sell_instant_market_name": (market_by_key.get(out_buy_market) or {}).get("name") or out_buy_market,
-            "sell_instant_kind": out_buy_market_kind,
-            "sell_instant_region_id": out_buy_region_id,
-            "sell_instant_structure_id": out_buy_structure_id,
-            "sell_patient_market": out_sell_market,
-            "sell_patient_market_name": (market_by_key.get(out_sell_market) or {}).get("name") or out_sell_market,
-            "sell_patient_kind": out_sell_market_kind,
-            "sell_patient_region_id": out_sell_region_id,
-            "sell_patient_structure_id": out_sell_structure_id,
-            "sell_markets_considered": sell_market_keys,
-            "output_buy_by_market": out_buy_by_market,
-            "output_sell_by_market": out_sell_by_market,
-            "output_buy_orders_by_market": out_buy_orders_by_market,
-            "output_sell_orders_by_market": out_sell_orders_by_market,
-            "blueprint_cost": bp_cost,
-            "blueprint_sell_orders": bp_sell_orders,
-            "confidence": confidence,
-            "confidence_details": c_details,
-            "instant": instant,
-            "patient": patient,
-            "profit": instant["profit"],
-            "profit_per_hour": profit_per_hour,
-            "roi": instant["roi"],
-            "cost": instant["cost"],
-            "revenue": instant["revenue"],
-            "fees": instant["fees"],
-            "materials": instant["materials"],
-            "payback_runs": None,
-            "depth": None,
-        })
-
-    # Refining
-    print("[update_rankings] Computing refining rankings…")
     refining_rows: List[Dict[str, Any]] = []
-    for rr in recipes.get("refining") or []:
-        in_tid = safe_int(rr.get("input_type_id"), 0)
-        if in_tid <= 0:
-            continue
-        batch_units = safe_int(rr.get("batch_units"), 1)
-        batch_m3 = safe_float(rr.get("batch_m3"), 0.0)
-        if batch_units <= 0:
-            batch_units = 1
-        # Require ore/ice to have some sell depth
-        if order_count(in_tid, "sell") < args.min_ref_input_sell_orders:
-            continue
-
-        in_cost_unit = price(in_tid, "sell")
-        if in_cost_unit <= 0:
-            continue
-        in_cost = in_cost_unit * batch_units
-
-        outs = rr.get("outputs") or []
-        out_items: List[Dict[str, Any]] = []
-        revenue = 0.0
-        ok = False
-        for o in outs:
-            ot = safe_int(o.get("type_id"), 0)
-            qty = safe_float(o.get("qty"), 0.0)
-            if ot <= 0 or qty <= 0:
-                continue
-            # We assume you sell minerals to buy orders
-            if order_count(ot, "buy") < args.min_ref_output_buy_orders:
-                continue
-            p = price(ot, "buy")
-            if p <= 0:
-                continue
-            ext = qty * p
-            out_items.append({
-                "type_id": ot,
-                "name": o.get("name") or types.get(ot, {}).get("name", f"type {ot}"),
-                "qty": qty,
-                "unit_price": p,
-                "extended": ext,
-            })
-            revenue += ext
-            ok = True
-
-        if not ok or revenue <= 0:
-            continue
-
-        # Refining doesn't pay industry job install; taxes depend on structure. We'll leave job cost 0.
-        fees = revenue * fee_model.sales_tax
-        profit = revenue - in_cost - fees
-        roi = profit / in_cost if in_cost > 0 else None
-        profit_per_m3 = profit / batch_m3 if batch_m3 > 0 else None
-
-        c0, c_details = compute_confidence_from_stats(tstats(in_tid))
-        confidence = c0  # confidence of the input market (ore/ice)
-
-        refining_rows.append({
-            "category": "refining",
-            "input_type_id": in_tid,
-            "input_name": rr.get("input_name") or types.get(in_tid, {}).get("name", f"type {in_tid}"),
-            "batch_units": batch_units,
-            "batch_m3": batch_m3,
-            "materials": out_items,  # show outputs in breakdown list
-            "cost": in_cost,
-            "revenue": revenue,
-            "fees": fees,
-            "profit": profit,
-            "profit_per_m3": profit_per_m3,
-            "roi": roi,
-            "confidence": confidence,
-            "confidence_details": c_details,
-            "depth": None,
-            "meta": rr.get("meta"),
-        })
-
-    # T2 / invention
-    print("[update_rankings] Computing T2 invention rankings…")
-    invention_map: Dict[int, Dict[str, Any]] = {}
-    for inv in recipes.get("invention") or []:
-        t2_bp = safe_int(inv.get("t2_blueprint_type_id"), 0)
-        if t2_bp > 0:
-            invention_map[t2_bp] = inv
-
     t2_rows: List[Dict[str, Any]] = []
-    # Find manufacturing recipes whose blueprint is inventable.
-    for r in recipes.get("manufacturing") or []:
-        t2_bp = safe_int(r.get("blueprint_type_id"), 0)
-        prod_tid = safe_int(r.get("product_type_id"), 0)
-        time_s = safe_int(r.get("time_s"), 0)
-        out_qty = safe_float(r.get("output_qty"), 1.0)
-        if t2_bp <= 0 or prod_tid <= 0:
-            continue
-        if t2_bp not in invention_map:
-            continue
+
+    # Skill-aware time multipliers
+    skill_levels = (character.get("skills") or {}) if isinstance(character.get("skills"), dict) else {}
+
+    # ---------- Manufacturing ----------
+    for r in mfg_recipes:
+        pt = safe_int(r.get("product_type_id"), 0)
+        bp = safe_int(r.get("blueprint_type_id"), 0)
+        out_qty = safe_float(r.get("output_qty"), 1.0) if r.get("output_qty") is not None else 1.0
+        time_s = safe_float(r.get("time_s"), 0.0)
         if time_s < args.min_job_time_s:
             continue
-        # Output must be sellable in at least one of the configured sell markets.
-        out_buy_by_market: Dict[str, float] = {}
-        out_sell_by_market: Dict[str, float] = {}
-        out_buy_orders_by_market: Dict[str, int] = {}
-        out_sell_orders_by_market: Dict[str, int] = {}
+        time_s = apply_time_modifiers(time_s, "manufacturing", skill_levels)
 
-        best_buy_market: Optional[str] = None
-        best_buy_price: float = 0.0
-        best_sell_market_key: Optional[str] = None
-        best_sell_price: float = 0.0
-
-        for mk in sell_market_keys:
-            pb = market_price(mk, prod_tid, "buy")
-            ps = market_price(mk, prod_tid, "sell")
-            ob = market_order_count(mk, prod_tid, "buy")
-            os_ = market_order_count(mk, prod_tid, "sell")
-            if pb <= 0 and ps <= 0 and ob <= 0 and os_ <= 0:
-                continue
-            out_buy_by_market[mk] = pb
-            out_sell_by_market[mk] = ps
-            out_buy_orders_by_market[mk] = ob
-            out_sell_orders_by_market[mk] = os_
-            if ob >= args.min_output_buy_orders and pb > best_buy_price:
-                best_buy_price = pb
-                best_buy_market = mk
-            if os_ > 0 and ps > best_sell_price:
-                best_sell_price = ps
-                best_sell_market_key = mk
-
-        if not best_buy_market or best_buy_price <= 0:
+        # blueprint price availability check (in buy market)
+        bp_stats = stats_for(buy_market.key, bp)
+        if fuzz_order_count(bp_stats, "sell") < args.min_blueprint_sell_orders:
+            continue
+        bp_cost = price_for(buy_market.key, bp, "sell")
+        if bp_cost <= 0:
             continue
 
-        if not best_sell_market_key or best_sell_price <= 0:
-            best_sell_market_key = best_buy_market
-            best_sell_price = out_sell_by_market.get(best_sell_market_key) or 0.0
+        # materials in buy market
+        mats_instant: List[Dict[str, Any]] = []
+        mats_patient: List[Dict[str, Any]] = []
+        mats_for_depth: List[Dict[str, Any]] = []
 
-        out_buy = best_buy_price
-        out_sell = best_sell_price
-        out_buy_market = best_buy_market
-        out_sell_market = best_sell_market_key
-        out_buy_region_id = safe_int(market_by_key.get(out_buy_market, {}).get("region_id"), 0)
-        out_sell_region_id = safe_int(market_by_key.get(out_sell_market, {}).get("region_id"), 0)
-        out_buy_structure_id = safe_int(market_by_key.get(out_buy_market, {}).get("structure_id"), 0)
-        out_sell_structure_id = safe_int(market_by_key.get(out_sell_market, {}).get("structure_id"), 0)
-        out_buy_market_kind = (market_by_key.get(out_buy_market, {}).get("kind") or "station")
-        out_sell_market_kind = (market_by_key.get(out_sell_market, {}).get("kind") or "station")
-
-
-        inv = invention_map[t2_bp]
-        p = safe_float(inv.get("probability"), 0.4)
-        if p <= 0:
-            p = 0.4
-        runs_per_success = safe_int(inv.get("runs_per_success"), 1)
-        if runs_per_success <= 0:
-            runs_per_success = 1
-        inv_time_s = safe_int(inv.get("time_s"), 0)
-
-        # T2 manufacturing materials
-        mats_mfg = r.get("materials") or []
-        mats2: List[Dict[str, Any]] = []
-        missing = False
-        for m in mats_mfg:
-            mt = safe_int(m.get("type_id"), 0)
+        ok = True
+        for m in r.get("materials") or []:
+            tid = safe_int(m.get("type_id"), 0)
             qty = safe_float(m.get("qty"), 0.0)
-            if mt <= 0 or qty <= 0:
+            if tid <= 0 or qty <= 0:
                 continue
-            sellp = price(mt, "sell")
-            buyp = price(mt, "buy")
-            if sellp <= 0:
-                missing = True
+            st = stats_for(buy_market.key, tid)
+            sellp = fuzz_price(st, "sell", args.price_mode)  # instant buy from sells
+            buyp = fuzz_price(st, "buy", args.price_mode)   # patient buy via buys
+            if sellp <= 0 or buyp <= 0:
+                ok = False
                 break
-            mats2.append({
-                "type_id": mt,
-                "name": m.get("name") or types.get(mt, {}).get("name", f"type {mt}"),
-                "qty": qty,
-                "unit_price_sell": sellp if sellp > 0 else None,
-                "unit_price_buy": buyp if buyp > 0 else None,
-            })
-        if missing or not mats2:
+            mats_instant.append({"type_id": tid, "name": tname(tid), "qty": qty, "unit_price": sellp, "unit_m3": tvol(tid)})
+            mats_patient.append({"type_id": tid, "name": tname(tid), "qty": qty, "unit_price": buyp, "unit_m3": tvol(tid)})
+            mats_for_depth.append({"type_id": tid, "qty": qty, "unit_price": sellp})
+        if not ok:
             continue
 
-        for m in mats2:
-            m["extended_instant"] = safe_float(m.get("qty"), 0.0) * safe_float(m.get("unit_price_sell"), 0.0)
+        # job cost per run (manufacturing activity)
+        job_cost = job_install_cost_per_run(adjusted_prices, mfg_ci, mats_for_depth, out_qty, fee_model)
 
-        # Invention materials per attempt
-        inv_mats = inv.get("materials") or []
-        inv_mats2: List[Dict[str, Any]] = []
-        inv_missing = False
-        for m in inv_mats:
-            mt = safe_int(m.get("type_id"), 0)
-            qty = safe_float(m.get("qty"), 0.0)
-            if mt <= 0 or qty <= 0:
+        # Evaluate across sell markets
+        per_market: Dict[str, Any] = {}
+        best_instant_key = None
+        best_patient_key = None
+        best_instant_profitph = -1e99
+        best_patient_profitph = -1e99
+
+        for sm in sell_markets:
+            # output prices in this sell market
+            out_buy = price_for(sm.key, pt, "buy")   # instant sell to buys
+            out_sell = price_for(sm.key, pt, "sell") # patient sell via sells
+            if out_buy <= 0 or out_sell <= 0:
                 continue
-            sellp = price(mt, "sell")
-            buyp = price(mt, "buy")
-            if sellp <= 0:
-                inv_missing = True
-                break
-            inv_mats2.append({
-                "type_id": mt,
-                "name": m.get("name") or types.get(mt, {}).get("name", f"type {mt}"),
-                "qty": qty,
-                "unit_price_sell": sellp if sellp > 0 else None,
-                "unit_price_buy": buyp if buyp > 0 else None,
-            })
-        if inv_missing or not inv_mats2:
+
+            inst = compute_mode_metrics(out_buy, out_qty, mats_instant, time_s, fee_model, job_cost, blueprint_cost=bp_cost, blueprint_runs=r.get("blueprint_runs"))
+            pat = compute_mode_metrics(out_sell, out_qty, mats_patient, time_s, fee_model, job_cost, blueprint_cost=bp_cost, blueprint_runs=r.get("blueprint_runs"))
+
+            conf, conf_details = compute_confidence_from_market_stats(stats_for(sm.key, pt))
+            per_market[sm.key] = {
+                "market_name": sm.name,
+                "confidence": conf,
+                "confidence_details": conf_details,
+                "instant": inst,
+                "patient": pat,
+            }
+
+            if conf >= args.best_min_confidence and fuzz_order_count(stats_for(sm.key, pt), "buy") >= args.min_output_buy_orders:
+                if inst["profit_per_hour"] > best_instant_profitph:
+                    best_instant_profitph = inst["profit_per_hour"]
+                    best_instant_key = sm.key
+                if pat["profit_per_hour"] > best_patient_profitph:
+                    best_patient_profitph = pat["profit_per_hour"]
+                    best_patient_key = sm.key
+
+        if not per_market:
             continue
 
-        # Job costs
-        job_cost_mfg = job_install_cost(adjusted_prices, mats2, mfg_cost_index, fee_model)
-        job_cost_inv = job_install_cost(adjusted_prices, inv_mats2, inv_cost_index, fee_model)
+        # If no market met confidence threshold, fall back to pure best profit
+        if best_instant_key is None:
+            best_instant_key = max(per_market.keys(), key=lambda k: per_market[k]["instant"]["profit_per_hour"])
+        if best_patient_key is None:
+            best_patient_key = max(per_market.keys(), key=lambda k: per_market[k]["patient"]["profit_per_hour"])
 
-        # Compute invention amortized cost per *manufacturing run* in instant mode
-        inv_attempt_cost = sum(safe_float(m["qty"]) * safe_float(m["unit_price_sell"]) for m in inv_mats2)
-        inv_attempt_fees = job_cost_inv  # job install cost per attempt (no sales/broker here)
-        expected_attempts_per_success = 1.0 / p if p > 0 else 10.0
-        inv_cost_per_success = (inv_attempt_cost + inv_attempt_fees) * expected_attempts_per_success
-        inv_cost_per_run = inv_cost_per_success / runs_per_success
+        best_inst = per_market[best_instant_key]["instant"]
+        best_pat = per_market[best_patient_key]["patient"]
 
-        inv_time_per_success = inv_time_s * expected_attempts_per_success
-        inv_time_per_run = inv_time_per_success / runs_per_success
+        # hauling metrics (per run) based on best instant metrics (materials same across markets)
+        output_m3 = out_qty * tvol(pt)
+        total_m3 = best_inst.get("input_m3_per_run", 0.0) + output_m3
+        profit_per_m3_total = best_inst["profit"] / total_m3 if total_m3 > 0 else 0.0
+        profit_per_m3_out = best_inst["profit"] / output_m3 if output_m3 > 0 else 0.0
 
-
-        # Instant mode: buy inputs from sell, sell output to buy, include sales tax, include mfg job install, plus invention overhead
-        instant_mfg = compute_mode_metrics(
-            output_qty=out_qty,
-            output_price=out_buy,
-            mats=mats2,
-            mat_price_key="unit_price_sell",
-            fee_model=fee_model,
-            include_broker_on_inputs=False,
-            include_broker_on_outputs=False,
-            include_sales_tax=True,
-            job_cost_per_run=job_cost_mfg,
+        manufacturing_rows.append(
+            {
+                "category": "manufacturing",
+                "product_type_id": pt,
+                "product_name": tname(pt),
+                "blueprint_type_id": bp,
+                "blueprint_name": tname(bp),
+                "output_qty": out_qty,
+                "time_s": time_s,
+                "blueprint_cost": bp_cost,
+                "blueprint_runs": r.get("blueprint_runs"),
+                "blueprint_sell_orders": fuzz_order_count(bp_stats, "sell"),
+                "payback_runs": (int(math.ceil(bp_cost / best_inst["profit"])) if best_inst.get("profit", 0.0) > 0 else None),
+                "alternatives": {
+                    "instant": summarize_alternatives(per_market, "instant", top_k=3),
+                    "patient": summarize_alternatives(per_market, "patient", top_k=3),
+                },  # for UI transparency
+                "best_market": {"instant": best_instant_key, "patient": best_patient_key},
+                "best_market_name": {"instant": cfg.markets[best_instant_key].name if best_instant_key in cfg.markets else best_instant_key,
+                                     "patient": cfg.markets[best_patient_key].name if best_patient_key in cfg.markets else best_patient_key},
+                "instant": best_inst,
+                "patient": best_pat,
+                "confidence": per_market[best_instant_key]["confidence"],
+                "hauling": {
+                    "input_m3_per_run": best_inst.get("input_m3_per_run", 0.0),
+                    "output_m3_per_run": output_m3,
+                    "total_m3_per_run": total_m3,
+                    "profit_per_m3_total": profit_per_m3_total,
+                    "profit_per_m3_out": profit_per_m3_out,
+                },
+                "depth": None,
+                "ttl": None,
+            }
         )
-        # Add invention overhead to cost/fees by treating it as extra cost
-        instant_profit = instant_mfg["profit"] - inv_cost_per_run
-        instant_cost_total = instant_mfg["cost"] + inv_cost_per_run
-        instant_roi = instant_profit / instant_cost_total if instant_cost_total > 0 else None
 
-        # Profit/hour considering manufacturing time only and combined time
-        profit_per_mfg_hour = instant_profit / (time_s / 3600) if time_s > 0 else None
-        total_time_s_per_run = time_s + inv_time_per_run
-        profit_per_total_hour = instant_profit / (total_time_s_per_run / 3600) if total_time_s_per_run > 0 else None
+    # ---------- Reactions ----------
+    for r in rx_recipes:
+        pt = safe_int(r.get("product_type_id"), 0)
+        bp = safe_int(r.get("blueprint_type_id"), 0)
+        out_qty = safe_float(r.get("output_qty"), 1.0) if r.get("output_qty") is not None else 1.0
+        time_s = safe_float(r.get("time_s"), 0.0)
+        if time_s < args.min_job_time_s:
+            continue
+        time_s = apply_time_modifiers(time_s, "reactions", skill_levels)
 
-        c0, c_details = compute_confidence_from_stats(market_stats(out_buy_market, prod_tid))
-        confidence = c0
+        bp_stats = stats_for(buy_market.key, bp)
+        if fuzz_order_count(bp_stats, "sell") < args.min_blueprint_sell_orders:
+            continue
+        bp_cost = price_for(buy_market.key, bp, "sell")
+        if bp_cost <= 0:
+            continue
 
-        t2_rows.append({
-            "category": "t2",
-            "product_type_id": prod_tid,
-            "product_name": r.get("product_name") or types.get(prod_tid, {}).get("name", f"type {prod_tid}"),
-            "t2_blueprint_type_id": t2_bp,
-            "t2_blueprint_name": r.get("blueprint_name") or types.get(t2_bp, {}).get("name", f"type {t2_bp}"),
-            "output_qty": out_qty,
-            "time_s": time_s,
-            "buy_market": buy_market_key,
-            "sell_instant_market": out_buy_market,
-            "sell_instant_market_name": (market_by_key.get(out_buy_market) or {}).get("name") or out_buy_market,
-            "sell_instant_kind": out_buy_market_kind,
-            "sell_instant_region_id": out_buy_region_id,
-            "sell_instant_structure_id": out_buy_structure_id,
-            "sell_patient_market": out_sell_market,
-            "sell_patient_market_name": (market_by_key.get(out_sell_market) or {}).get("name") or out_sell_market,
-            "sell_patient_kind": out_sell_market_kind,
-            "sell_patient_region_id": out_sell_region_id,
-            "sell_patient_structure_id": out_sell_structure_id,
-            "sell_markets_considered": sell_market_keys,
-            "output_buy_by_market": out_buy_by_market,
-            "output_sell_by_market": out_sell_by_market,
-            "output_buy_orders_by_market": out_buy_orders_by_market,
-            "output_sell_orders_by_market": out_sell_orders_by_market,
-            "confidence": confidence,
-            "confidence_details": c_details,
-            "materials": instant_mfg["materials"],
-            "instant": {
-                **instant_mfg,
-                "profit": instant_profit,
-                "roi": instant_roi,
-                "cost_total": instant_cost_total,
-                "profit_per_mfg_hour": profit_per_mfg_hour,
-                "profit_per_total_hour": profit_per_total_hour,
-                "time_total_s": total_time_s_per_run,
-            },
-            "invention": {
-                "t1_blueprint_type_id": safe_int(inv.get("t1_blueprint_type_id"), 0),
-                "t1_blueprint_name": inv.get("t1_blueprint_name"),
-                "probability": p,
-                "runs_per_success": runs_per_success,
-                "time_s": inv_time_s,
-                "expected_attempts_per_success": expected_attempts_per_success,
-                "materials": inv_mats2,
-                "attempt_cost": inv_attempt_cost,
-                "job_cost_per_attempt": job_cost_inv,
-                "cost_per_success": inv_cost_per_success,
-                "cost_per_run": inv_cost_per_run,
-                "time_per_run_s": inv_time_per_run,
-            },
-            "profit": instant_profit,
-            "profit_per_hour": profit_per_total_hour,
-            "roi": instant_roi,
-            "cost": instant_cost_total,
-            "revenue": instant_mfg["revenue"],
-            "fees": instant_mfg["fees"],  # market+industry fees (not invention overhead)
-            "depth": None,
-        })
+        mats_instant: List[Dict[str, Any]] = []
+        mats_patient: List[Dict[str, Any]] = []
+        mats_for_depth: List[Dict[str, Any]] = []
+        ok = True
+        for m in r.get("materials") or []:
+            tid = safe_int(m.get("type_id"), 0)
+            qty = safe_float(m.get("qty"), 0.0)
+            if tid <= 0 or qty <= 0:
+                continue
+            st = stats_for(buy_market.key, tid)
+            sellp = fuzz_price(st, "sell", args.price_mode)
+            buyp = fuzz_price(st, "buy", args.price_mode)
+            if sellp <= 0 or buyp <= 0:
+                ok = False
+                break
+            mats_instant.append({"type_id": tid, "name": tname(tid), "qty": qty, "unit_price": sellp, "unit_m3": tvol(tid)})
+            mats_patient.append({"type_id": tid, "name": tname(tid), "qty": qty, "unit_price": buyp, "unit_m3": tvol(tid)})
+            mats_for_depth.append({"type_id": tid, "qty": qty, "unit_price": sellp})
+        if not ok:
+            continue
 
-    # Sort and cap output
-    def sort_and_cap(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
-        rows2 = [r for r in rows if r.get(key) is not None]
-        rows2.sort(key=lambda r: safe_float(r.get(key), -1e18), reverse=True)
-        return rows2[: args.max_rows]
+        job_cost = job_install_cost_per_run(adjusted_prices, rx_ci, mats_for_depth, out_qty, fee_model)
 
-    manufacturing_rows = sort_and_cap(manufacturing_rows, "profit_per_hour")
-    reaction_rows = sort_and_cap(reaction_rows, "profit_per_hour")
-    refining_rows = sort_and_cap(refining_rows, "profit_per_m3")
-    t2_rows = sort_and_cap(t2_rows, "profit_per_hour")
+        per_market: Dict[str, Any] = {}
+        best_instant_key = None
+        best_patient_key = None
+        best_instant_profitph = -1e99
+        best_patient_profitph = -1e99
 
-    # Optional: history-based confidence bump for top candidates across all categories
-    if args.confidence_history:
-        print("[update_rankings] Fetching ESI market history for confidence bump (top candidates)…")
-        # Gather unique output type ids among top candidates
-        cand_type_ids: Set[int] = set()
-        for r in manufacturing_rows[: args.depth_top_n]:
-            cand_type_ids.add(int(r["product_type_id"]))
-        for r in reaction_rows[: args.depth_top_n]:
-            cand_type_ids.add(int(r["product_type_id"]))
-        for r in t2_rows[: args.depth_top_n]:
-            cand_type_ids.add(int(r["product_type_id"]))
-        # Refining: use input ore type ids
-        for r in refining_rows[: args.depth_top_n]:
-            cand_type_ids.add(int(r["input_type_id"]))
+        for sm in sell_markets:
+            out_buy = price_for(sm.key, pt, "buy")
+            out_sell = price_for(sm.key, pt, "sell")
+            if out_buy <= 0 or out_sell <= 0:
+                continue
 
-        history_cache: Dict[int, List[Dict[str, Any]]] = {}
-        for tid in sorted(cand_type_ids):
+            inst = compute_mode_metrics(out_buy, out_qty, mats_instant, time_s, fee_model, job_cost, blueprint_cost=bp_cost, blueprint_runs=r.get("blueprint_runs"))
+            pat = compute_mode_metrics(out_sell, out_qty, mats_patient, time_s, fee_model, job_cost, blueprint_cost=bp_cost, blueprint_runs=r.get("blueprint_runs"))
+
+            conf, conf_details = compute_confidence_from_market_stats(stats_for(sm.key, pt))
+            per_market[sm.key] = {
+                "market_name": sm.name,
+                "confidence": conf,
+                "confidence_details": conf_details,
+                "instant": inst,
+                "patient": pat,
+            }
+            if conf >= args.best_min_confidence and fuzz_order_count(stats_for(sm.key, pt), "buy") >= args.min_output_buy_orders:
+                if inst["profit_per_hour"] > best_instant_profitph:
+                    best_instant_profitph = inst["profit_per_hour"]
+                    best_instant_key = sm.key
+                if pat["profit_per_hour"] > best_patient_profitph:
+                    best_patient_profitph = pat["profit_per_hour"]
+                    best_patient_key = sm.key
+
+        if not per_market:
+            continue
+        if best_instant_key is None:
+            best_instant_key = max(per_market.keys(), key=lambda k: per_market[k]["instant"]["profit_per_hour"])
+        if best_patient_key is None:
+            best_patient_key = max(per_market.keys(), key=lambda k: per_market[k]["patient"]["profit_per_hour"])
+
+        best_inst = per_market[best_instant_key]["instant"]
+        best_pat = per_market[best_patient_key]["patient"]
+
+        output_m3 = out_qty * tvol(pt)
+        total_m3 = best_inst.get("input_m3_per_run", 0.0) + output_m3
+        profit_per_m3_total = best_inst["profit"] / total_m3 if total_m3 > 0 else 0.0
+
+        reaction_rows.append(
+            {
+                "category": "reactions",
+                "product_type_id": pt,
+                "product_name": tname(pt),
+                "blueprint_type_id": bp,
+                "blueprint_name": tname(bp),
+                "output_qty": out_qty,
+                "time_s": time_s,
+                "blueprint_cost": bp_cost,
+                "blueprint_runs": r.get("blueprint_runs"),
+                "blueprint_sell_orders": fuzz_order_count(bp_stats, "sell"),
+                "payback_runs": (int(math.ceil(bp_cost / best_inst["profit"])) if best_inst.get("profit", 0.0) > 0 else None),
+                "alternatives": {
+                    "instant": summarize_alternatives(per_market, "instant", top_k=3),
+                    "patient": summarize_alternatives(per_market, "patient", top_k=3),
+                },
+                "best_market": {"instant": best_instant_key, "patient": best_patient_key},
+                "best_market_name": {"instant": cfg.markets[best_instant_key].name if best_instant_key in cfg.markets else best_instant_key,
+                                     "patient": cfg.markets[best_patient_key].name if best_patient_key in cfg.markets else best_patient_key},
+                "instant": best_inst,
+                "patient": best_pat,
+                "confidence": per_market[best_instant_key]["confidence"],
+                "hauling": {
+                    "input_m3_per_run": best_inst.get("input_m3_per_run", 0.0),
+                    "output_m3_per_run": output_m3,
+                    "total_m3_per_run": total_m3,
+                    "profit_per_m3_total": profit_per_m3_total,
+                },
+                "depth": None,
+                "ttl": None,
+            }
+        )
+
+    # ---------- Refining ----------
+    # Refining rows stay simpler (no instant/patient). We treat:
+    #  - buy ore/ice in buy market (sell price)
+    #  - sell minerals basket into BUY orders of best sell market
+    for r in ref_recipes:
+        in_tid = safe_int(r.get("input_type_id"), 0)
+        units = safe_float(r.get("batch_units"), 0.0)
+        batch_m3 = safe_float(r.get("batch_m3"), 0.0)
+        if in_tid <= 0 or units <= 0:
+            continue
+        st_in = stats_for(buy_market.key, in_tid)
+        if fuzz_order_count(st_in, "sell") < args.min_ref_input_sell_orders:
+            continue
+        in_unit_price = fuzz_price(st_in, "sell", args.price_mode)
+        if in_unit_price <= 0:
+            continue
+        cost = in_unit_price * units
+
+        # value outputs per sell market
+        best_key = None
+        best_profit = -1e99
+        best_rev = 0.0
+        best_conf = 0
+
+        per_market_val: Dict[str, Any] = {}
+        for sm in sell_markets:
+            rev = 0.0
+            ok = True
+            worst_buy_oc = 1_000_000
+            for o in r.get("outputs") or []:
+                otid = safe_int(o.get("type_id"), 0)
+                oqty = safe_float(o.get("qty"), 0.0)
+                if otid <= 0 or oqty <= 0:
+                    continue
+                st = stats_for(sm.key, otid)
+                if fuzz_order_count(st, "buy") < args.min_ref_output_buy_orders:
+                    ok = False
+                    break
+                p = fuzz_price(st, "buy", args.price_mode)
+                if p <= 0:
+                    ok = False
+                    break
+                rev += p * oqty
+                worst_buy_oc = min(worst_buy_oc, fuzz_order_count(st, "buy"))
+            if not ok:
+                continue
+            profit = rev - cost
+            roi = profit / cost if cost > 0 else 0.0
+            conf, _ = compute_confidence_from_market_stats(stats_for(sm.key, in_tid))
+            per_market_val[sm.key] = {"revenue": rev, "profit": profit, "roi": roi, "confidence": conf}
+            if conf >= args.best_min_confidence and profit > best_profit:
+                best_profit = profit
+                best_rev = rev
+                best_key = sm.key
+                best_conf = conf
+
+        if best_key is None and per_market_val:
+            best_key = max(per_market_val.keys(), key=lambda k: per_market_val[k]["profit"])
+            best_profit = per_market_val[best_key]["profit"]
+            best_rev = per_market_val[best_key]["revenue"]
+            best_conf = per_market_val[best_key]["confidence"]
+
+        if best_key is None:
+            continue
+
+        refining_rows.append(
+            {
+                "category": "refining",
+                "input_type_id": in_tid,
+                "input_name": tname(in_tid),
+                "batch_units": units,
+                "batch_m3": batch_m3,
+                "cost": cost,
+                "revenue": best_rev,
+                "profit": best_profit,
+                "roi": (best_profit / cost) if cost > 0 else 0.0,
+                "profit_per_m3": best_profit / batch_m3 if batch_m3 > 0 else 0.0,
+                "best_market": best_key,
+                "best_market_name": cfg.markets[best_key].name if best_key in cfg.markets else best_key,
+                "confidence": best_conf,
+                "outputs": [
+                    {"type_id": safe_int(o.get("type_id"), 0), "name": tname(safe_int(o.get("type_id"), 0)), "qty": safe_float(o.get("qty"), 0.0)}
+                    for o in r.get("outputs") or []
+                    if safe_int(o.get("type_id"), 0) > 0 and safe_float(o.get("qty"), 0.0) > 0
+                ],
+                "per_market": per_market_val,
+            }
+        )
+
+    # ---------- T2 / Invention pipeline (best-effort) ----------
+    # We assume inv_recipes items already include:
+    #  - invention_materials: [{type_id, qty}]
+    #  - manufacturing_materials: [{type_id, qty}]
+    #  - product_type_id, output_qty, time_s, success_chance, attempts_per_success (or derived)
+    for r in inv_recipes:
+        pt = safe_int(r.get("product_type_id"), 0)
+        out_qty = safe_float(r.get("output_qty"), 1.0) if r.get("output_qty") is not None else 1.0
+        time_s = safe_float(r.get("time_s"), 0.0)
+        if time_s < args.min_job_time_s:
+            continue
+        time_s = apply_time_modifiers(time_s, "invention", skill_levels)
+
+        # Invention + manufacturing materials costs in buy market
+        inv_mats: List[Dict[str, Any]] = []
+        mfg_mats: List[Dict[str, Any]] = []
+        ok = True
+        for m in r.get("invention_materials") or []:
+            tid = safe_int(m.get("type_id"), 0)
+            qty = safe_float(m.get("qty"), 0.0)
+            if tid <= 0 or qty <= 0:
+                continue
+            st = stats_for(buy_market.key, tid)
+            sellp = fuzz_price(st, "sell", args.price_mode)
+            buyp = fuzz_price(st, "buy", args.price_mode)
+            if sellp <= 0 or buyp <= 0:
+                ok = False
+                break
+            inv_mats.append({"type_id": tid, "name": tname(tid), "qty": qty, "unit_price": sellp, "unit_m3": tvol(tid)})
+        if not ok:
+            continue
+        for m in r.get("manufacturing_materials") or []:
+            tid = safe_int(m.get("type_id"), 0)
+            qty = safe_float(m.get("qty"), 0.0)
+            if tid <= 0 or qty <= 0:
+                continue
+            st = stats_for(buy_market.key, tid)
+            sellp = fuzz_price(st, "sell", args.price_mode)
+            buyp = fuzz_price(st, "buy", args.price_mode)
+            if sellp <= 0 or buyp <= 0:
+                ok = False
+                break
+            mfg_mats.append({"type_id": tid, "name": tname(tid), "qty": qty, "unit_price": sellp, "unit_m3": tvol(tid)})
+        if not ok:
+            continue
+
+        inv_attempts = safe_float(r.get("attempts_per_success"), 1.0)
+        if inv_attempts <= 0:
+            inv_attempts = 1.0
+
+        inv_cost = sum(m["qty"] * m["unit_price"] for m in inv_mats) * inv_attempts
+        mfg_cost = sum(m["qty"] * m["unit_price"] for m in mfg_mats)
+        inv_mats_scaled: List[Dict[str, Any]] = []
+        for m in inv_mats:
+            qty_run = safe_float(m.get("qty"), 0.0) * float(inv_attempts)
+            inv_mats_scaled.append(
+                {
+                    "type_id": safe_int(m.get("type_id"), 0),
+                    "name": m.get("name") or tname(safe_int(m.get("type_id"), 0)),
+                    "qty": qty_run,
+                    "unit_price": safe_float(m.get("unit_price"), 0.0),
+                    "extended": qty_run * safe_float(m.get("unit_price"), 0.0),
+                }
+            )
+        mats_total_cost = inv_cost + mfg_cost
+
+        # Job install cost (approx) for invention activity; we use invention + manufacturing mats
+        mats_for_job = [{"type_id": m["type_id"], "qty": m["qty"], "unit_price": m["unit_price"]} for m in mfg_mats]
+        job_cost = job_install_cost_per_run(adjusted_prices, inv_ci, mats_for_job, out_qty, fee_model)
+
+        # Evaluate across sell markets (instant / patient)
+        per_market: Dict[str, Any] = {}
+        best_instant_key = None
+        best_patient_key = None
+        best_instant_profitph = -1e99
+        best_patient_profitph = -1e99
+
+        # For invention rows, treat "materials" as merged list (for UI); unit prices differ by mode not modeled deeply here.
+        merged_instant = inv_mats + mfg_mats
+        merged_patient = merged_instant  # keep same for simplicity
+
+        for sm in sell_markets:
+            out_buy = price_for(sm.key, pt, "buy")
+            out_sell = price_for(sm.key, pt, "sell")
+            if out_buy <= 0 or out_sell <= 0:
+                continue
+
+            inst = compute_mode_metrics(out_buy, out_qty, merged_instant, time_s, fee_model, job_cost, blueprint_cost=None, blueprint_runs=None)
+            pat = compute_mode_metrics(out_sell, out_qty, merged_patient, time_s, fee_model, job_cost, blueprint_cost=None, blueprint_runs=None)
+            # Replace materials_cost with our amortized invention cost model (since compute_mode_metrics sums per-run)
+            # We do this so profit reflects invention attempts.
+            inst["materials_cost"] = mats_total_cost
+            inst["cost"] = mats_total_cost + inst["job_cost"] + inst["fees"]
+            inst["profit"] = inst["revenue"] - inst["cost"]
+            inst["roi"] = inst["profit"] / inst["cost"] if inst["cost"] > 0 else 0.0
+            inst["profit_per_hour"] = inst["profit"] / (time_s / 3600.0) if time_s > 0 else 0.0
+
+            pat["materials_cost"] = mats_total_cost
+            pat["cost"] = mats_total_cost + pat["job_cost"] + pat["fees"]
+            pat["profit"] = pat["revenue"] - pat["cost"]
+            pat["roi"] = pat["profit"] / pat["cost"] if pat["cost"] > 0 else 0.0
+            pat["profit_per_hour"] = pat["profit"] / (time_s / 3600.0) if time_s > 0 else 0.0
+
+            conf, conf_details = compute_confidence_from_market_stats(stats_for(sm.key, pt))
+            per_market[sm.key] = {
+                "market_name": sm.name,
+                "confidence": conf,
+                "confidence_details": conf_details,
+                "instant": inst,
+                "patient": pat,
+            }
+
+            if conf >= args.best_min_confidence and fuzz_order_count(stats_for(sm.key, pt), "buy") >= args.min_output_buy_orders:
+                if inst["profit_per_hour"] > best_instant_profitph:
+                    best_instant_profitph = inst["profit_per_hour"]
+                    best_instant_key = sm.key
+                if pat["profit_per_hour"] > best_patient_profitph:
+                    best_patient_profitph = pat["profit_per_hour"]
+                    best_patient_key = sm.key
+
+        if not per_market:
+            continue
+        if best_instant_key is None:
+            best_instant_key = max(per_market.keys(), key=lambda k: per_market[k]["instant"]["profit_per_hour"])
+        if best_patient_key is None:
+            best_patient_key = max(per_market.keys(), key=lambda k: per_market[k]["patient"]["profit_per_hour"])
+
+        t2_rows.append(
+            {
+                "category": "t2",
+                "product_type_id": pt,
+                "product_name": tname(pt),
+                "output_qty": out_qty,
+                "time_s": time_s,
+                "attempts_per_success": inv_attempts,
+                "invention_cost": inv_cost,
+                "invention": {
+                    "attempts_per_success": inv_attempts,
+                    "cost_per_run": inv_cost,
+                    "materials": inv_mats_scaled,
+                },
+                "manufacturing_cost": mfg_cost,
+                "alternatives": {
+                    "instant": summarize_alternatives(per_market, "instant", top_k=3),
+                    "patient": summarize_alternatives(per_market, "patient", top_k=3),
+                },
+                "best_market": {"instant": best_instant_key, "patient": best_patient_key},
+                "best_market_name": {"instant": cfg.markets[best_instant_key].name if best_instant_key in cfg.markets else best_instant_key,
+                                     "patient": cfg.markets[best_patient_key].name if best_patient_key in cfg.markets else best_patient_key},
+                "instant": per_market[best_instant_key]["instant"],
+                "patient": per_market[best_patient_key]["patient"],
+                "confidence": per_market[best_instant_key]["confidence"],
+                "depth": None,
+                "ttl": None,
+            }
+        )
+
+    # -----------------------------
+    # Sort and keep top rows
+    # -----------------------------
+
+    def sort_key(row: Dict[str, Any]) -> float:
+        return safe_float((row.get("instant") or {}).get("profit_per_hour"), 0.0)
+
+    manufacturing_rows.sort(key=sort_key, reverse=True)
+    reaction_rows.sort(key=sort_key, reverse=True)
+    t2_rows.sort(key=sort_key, reverse=True)
+    refining_rows.sort(key=lambda r: safe_float(r.get("profit_per_m3"), 0.0), reverse=True)
+
+    manufacturing_rows = manufacturing_rows[: args.max_rows]
+    reaction_rows = reaction_rows[: args.max_rows]
+    t2_rows = t2_rows[: args.max_rows]
+    refining_rows = refining_rows[: args.max_rows]
+
+    # -----------------------------
+    # Depth validation + TTL for top-N (instant mode only)
+    # -----------------------------
+
+    structure_cache: Dict[int, List[Dict[str, Any]]] = {}
+
+    def add_depth_and_ttl(rows: List[Dict[str, Any]], kind: str) -> None:
+        top = rows[: min(args.depth_top_n, len(rows))]
+        for row in top:
             try:
-                hist = fetch_market_history(region_id, tid)
-                history_cache[tid] = hist
-                time.sleep(ESI_SLEEP_S)
+                best_market_key = (row.get("best_market") or {}).get("instant")
+                if not best_market_key:
+                    continue
+                out_market = cfg.markets.get(best_market_key) or buy_market
+                pt = safe_int(row.get("product_type_id"), 0)
+                out_qty = safe_float(row.get("output_qty"), 1.0)
+                mats = (row.get("instant") or {}).get("materials") or []
+                # convert mats to depth format {type_id, qty, unit_price}
+                depth_mats = [{"type_id": safe_int(m.get("type_id"), 0), "qty": safe_float(m.get("qty"), 0.0), "unit_price": safe_float(m.get("unit_price"), 0.0)} for m in mats]
+                d = validate_depth_for_recipe(
+                    input_market=buy_market,
+                    output_market=out_market,
+                    product_type_id=pt,
+                    output_qty=out_qty,
+                    materials=depth_mats,
+                    input_slippage=args.input_slippage,
+                    output_slippage=args.output_slippage,
+                    depth_safety=args.depth_safety,
+                    max_materials=args.depth_max_materials,
+                    access_token=access_token,
+                    structure_cache=structure_cache,
+                )
+
+                # compute depth-based expected profit at recommended runs using *mode fees* approximations
+                runs = safe_int(d.get("recommended_runs"), 0)
+                if runs <= 0:
+                    row["depth"] = {**d, "guaranteed": False}
+                    continue
+
+                # Depth uses only subset mats; scale using ratios vs displayed per-run
+                inst = row.get("instant") or {}
+                base_cost_per_run = safe_float(inst.get("cost"), 0.0)
+                base_profit_per_run = safe_float(inst.get("profit"), 0.0)
+                base_revenue_per_run = safe_float(inst.get("revenue"), 0.0)
+
+                depth_inputs_val = safe_float(((d.get("expected") or {}).get("inputs_value_depth_mats")), 0.0)
+                depth_output_val = safe_float(((d.get("expected") or {}).get("output_value")), 0.0)
+
+                # Estimate per-run depth-adjusted revenue and cost:
+                # - Replace revenue with depth output average (value / units) * out_qty
+                out_units = safe_float(((d.get("expected") or {}).get("output_units")), 0.0)
+                out_avg = depth_output_val / out_units if out_units > 0 else 0.0
+                depth_revenue_per_run = out_avg * out_qty
+
+                # - Replace only the subset of materials with depth inputs; keep rest from base (approx)
+                # Compute base cost of depth mats subset from inst materials list
+                base_depth_mats_cost = 0.0
+                depth_mat_ids = {safe_int(m.get("type_id"), 0) for m in (d.get("input") or {}).get("materials") or []}
+                for m in (inst.get("materials") or []):
+                    if safe_int(m.get("type_id"), 0) in depth_mat_ids:
+                        base_depth_mats_cost += safe_float(m.get("extended"), 0.0)
+                base_other_cost = base_cost_per_run - base_depth_mats_cost
+                depth_cost_per_run = base_other_cost + (depth_inputs_val / max(runs, 1))
+
+                depth_profit_per_run = depth_revenue_per_run - depth_cost_per_run
+                profit_total = depth_profit_per_run * runs
+
+                guaranteed = bool((d.get("input") or {}).get("filled_ok")) and bool((d.get("output") or {}).get("filled_ok")) and profit_total > 0
+
+                row["depth"] = {
+                    **d,
+                    "expected": {
+                        **(d.get("expected") or {}),
+                        "revenue_per_run": depth_revenue_per_run,
+                        "cost_per_run": depth_cost_per_run,
+                        "profit_per_run": depth_profit_per_run,
+                        "profit_total": profit_total,
+                    },
+                    "guaranteed": guaranteed,
+                    "sell_market": out_market.key,
+                    "sell_market_name": out_market.name,
+                }
+
+                # TTL based on region history if available
+                if args.confidence_history and out_market.region_id and pt:
+                    h = fetch_market_history(out_market.region_id, pt)
+                    adv = avg_daily_volume(h, days=7)
+                    if adv > 0:
+                        hours = (runs * out_qty) / adv * 24.0
+                        row["ttl"] = {"avg_daily_volume": adv, "hours": hours, "bucket": ttl_bucket(hours)}
+                    else:
+                        row["ttl"] = {"avg_daily_volume": 0.0, "hours": 0.0, "bucket": "unknown"}
             except Exception:
                 continue
 
-        def bump_row(row: Dict[str, Any], tid: int) -> None:
-            details = row.get("confidence_details") or {}
-            attach_history_liquidity(details, history_cache.get(tid) or [])
-            row["confidence_details"] = details
-            row["confidence"] = bump_confidence_with_history(int(row.get("confidence") or 0), details)
+    add_depth_and_ttl(manufacturing_rows, "manufacturing")
+    add_depth_and_ttl(reaction_rows, "reactions")
+    add_depth_and_ttl(t2_rows, "t2")
+    # refining depth validation is intentionally omitted here
 
-        for row in manufacturing_rows:
-            bump_row(row, int(row["product_type_id"]))
-        for row in reaction_rows:
-            bump_row(row, int(row["product_type_id"]))
-        for row in t2_rows:
-            bump_row(row, int(row["product_type_id"]))
-        for row in refining_rows:
-            bump_row(row, int(row["input_type_id"]))
-
-    # Depth validation for top N per category
-    print("[update_rankings] Depth-validating top candidates with ESI orderbooks…")
-    def do_depth(rows: List[Dict[str, Any]], is_refining: bool = False) -> None:
-        top = rows[: args.depth_top_n]
-        for row in top:
-            try:
-                if is_refining:
-                    # Refining: treat batch as 1 "run" of batch_units input.
-                    in_tid = int(row["input_type_id"])
-                    batch_units = int(row["batch_units"])
-                    # We'll validate only input depth + output minerals by value (from materials list)
-                    # Convert "materials" (outputs) into a fake materials list for output depth isn't meaningful,
-                    # so we treat "output depth" as the *minimum* mineral depth among top 3 minerals by value.
-                    # For simplicity, we re-use validate_depth_for_recipe on the input market only.
-                    depth = None
-                    # Input depth: can we buy X batches before ore price rises?
-                    # Build a pseudo recipe where output is the ore itself (so output depth is skipped).
-                    # We'll skip output depth for refining; it's rarely the bottleneck vs ore acquisition.
-                    raw = fetch_region_orders(region_id, in_tid, order_type="sell")
-                    time.sleep(ESI_SLEEP_S)
-                    book = normalize_orders(raw, side="sell")
-                    max_units = max_units_with_slippage(book, side="sell", slippage=args.input_slippage)
-                    max_batches = int(max_units // max(1, batch_units))
-                    rec_batches = int(math.floor(max_batches * args.depth_safety)) if max_batches > 0 else 1
-                    # Expected profit at rec_batches using ore orderbook avg
-                    req_units = batch_units * max(1, rec_batches)
-                    filled, ore_total, ore_avg = take_units(book, req_units)
-                    revenue_total = safe_float(row.get("revenue"), 0.0) * max(1, rec_batches)
-                    fees_total = revenue_total * args.sales_tax
-                    profit_total = revenue_total - ore_total - fees_total
-                    roi = profit_total / ore_total if ore_total > 0 else None
-
-                    row["depth"] = {
-                        "recommended_batches": max(1, rec_batches),
-                        "max_batches_input": max_batches if max_batches > 0 else None,
-                        "slippage": {"input": args.input_slippage, "safety": args.depth_safety},
-                        "ore": {
-                            "requested_units": req_units,
-                            "filled_units": filled,
-                            "total_cost": ore_total,
-                            "avg_price": ore_avg,
-                        },
-                        "expected": {
-                            "batches": max(1, rec_batches),
-                            "revenue_total": revenue_total,
-                            "cost_total": ore_total,
-                            "fees_total": fees_total,
-                            "profit_total": profit_total,
-                            "roi": roi,
-                        },
-                        "note": "Refining depth uses ore sell orders only (minerals are typically very liquid).",
-                    }
-                else:
-                    out_tid = int(row["product_type_id"])
-                    out_qty = safe_float(row.get("output_qty"), 1.0)
-                    mats = row.get("materials") or []
-                    out_rid = safe_int(row.get("sell_instant_region_id"), 0)
-                    if out_rid > 0:
-                        depth = validate_depth_for_recipe(
-                            input_region_id=region_id,
-                            output_region_id=out_rid,
-                            output_type_id=out_tid,
-                            output_qty_per_run=out_qty,
-                            materials=mats,
-                            input_slippage=args.input_slippage,
-                            output_slippage=args.output_slippage,
-                            safety=args.depth_safety,
-                            max_materials=args.depth_max_materials,
-                        )
-                    else:
-                        depth = {}
-                    # Attach scaled expectation at the recommended run count
-                    rec = int(depth.get("recommended_runs") or 1)
-                    inst = row.get("instant") or {}
-                    mats_used = row.get("materials") or []
-
-                    # Baseline totals at top-of-book (instant)
-                    base_mats_total = sum(safe_float(m.get("extended_used"), 0.0) for m in mats_used) * rec
-                    inv_over = safe_float((row.get("invention") or {}).get("cost_per_run"), 0.0)
-                    base_inv_total = inv_over * rec
-
-                    # Adjust a subset of inputs using orderbook average prices (slippage)
-                    adj_mats_total = base_mats_total
-                    input_details = (depth.get("inputs") or {}).get("details") or {}
-                    for m in mats_used:
-                        tid = str(int(m.get("type_id") or 0))
-                        det = input_details.get(tid)
-                        if not det:
-                            continue
-                        avg_p = safe_float(det.get("avg_price"), 0.0)
-                        base_p = safe_float(m.get("unit_price_used"), 0.0)
-                        qty_per_run = safe_float(m.get("qty"), 0.0)
-                        if avg_p > 0 and base_p > 0 and qty_per_run > 0:
-                            adj_mats_total += (avg_p - base_p) * qty_per_run * rec
-
-                    adj_cost_total = adj_mats_total + base_inv_total
-
-                    out_total = safe_float((depth.get("output") or {}).get("total"), 0.0)
-
-                    # Recompute fees: keep non-sales-tax fees linear; recompute sales tax from scaled revenue.
-                    fee_break = inst.get("fee_breakdown") or {}
-                    base_sales_tax_per_run = safe_float(fee_break.get("sales_tax"), 0.0)
-                    base_fees_per_run = safe_float(inst.get("fees"), 0.0)
-                    other_fees_per_run = max(0.0, base_fees_per_run - base_sales_tax_per_run)
-                    scaled_fees_total = other_fees_per_run * rec + out_total * args.sales_tax
-
-                    expected_profit_total = out_total - adj_cost_total - scaled_fees_total
-                    expected_profit_per_run = expected_profit_total / rec if rec > 0 else None
-                    expected_roi = expected_profit_total / adj_cost_total if adj_cost_total > 0 else None
-
-                    depth["expected"] = {
-                        "runs": rec,
-                        "revenue_total": out_total,
-                        "cost_total": adj_cost_total,
-                        "fees_total": scaled_fees_total,
-                        "profit_total": expected_profit_total,
-                        "profit_per_run": expected_profit_per_run,
-                        "roi": expected_roi,
-                    }
-
-                    row["depth"] = depth
-            except Exception as e:
-                row["depth"] = {"error": str(e)}
-
-    do_depth(manufacturing_rows, is_refining=False)
-    do_depth(reaction_rows, is_refining=False)
-    do_depth(t2_rows, is_refining=False)
-    do_depth(refining_rows, is_refining=True)
-
-
-    # Build compact type info for plan builder (volumes + names)
+    
+    # -----------------------------
+    # Build a compact type_info map for UI volume calculations
+    # -----------------------------
     used_type_ids: Set[int] = set()
-    def note_type(tid: int) -> None:
-        if tid and tid > 0:
-            used_type_ids.add(int(tid))
+
+    def _add_type_id(tid: Any) -> None:
+        t = safe_int(tid, 0)
+        if t > 0:
+            used_type_ids.add(t)
+
+    def _add_materials(mats: Any) -> None:
+        for m in mats or []:
+            _add_type_id(m.get("type_id"))
 
     for row in manufacturing_rows:
-        note_type(int(row.get("product_type_id") or 0))
-        note_type(int(row.get("blueprint_type_id") or 0))
-        for m in row.get("materials") or []:
-            note_type(int(m.get("type_id") or 0))
-
+        _add_type_id(row.get("product_type_id"))
+        _add_type_id(row.get("blueprint_type_id"))
+        _add_materials((row.get("instant") or {}).get("materials"))
     for row in reaction_rows:
-        note_type(int(row.get("product_type_id") or 0))
-        note_type(int(row.get("blueprint_type_id") or 0))
-        for m in row.get("materials") or []:
-            note_type(int(m.get("type_id") or 0))
-
+        _add_type_id(row.get("product_type_id"))
+        _add_type_id(row.get("blueprint_type_id"))
+        _add_materials((row.get("instant") or {}).get("materials"))
     for row in t2_rows:
-        note_type(int(row.get("product_type_id") or 0))
-        note_type(int(row.get("t2_blueprint_type_id") or 0))
-        inv = row.get("invention") or {}
-        note_type(int(inv.get("t1_blueprint_type_id") or 0))
-        for m in row.get("materials") or []:
-            note_type(int(m.get("type_id") or 0))
-        for m in (inv.get("materials") or []):
-            note_type(int(m.get("type_id") or 0))
-
+        _add_type_id(row.get("product_type_id"))
+        _add_materials((row.get("instant") or {}).get("materials"))
+        _add_materials((row.get("invention") or {}).get("materials"))
     for row in refining_rows:
-        note_type(int(row.get("input_type_id") or 0))
-        for o in row.get("materials") or []:
-            note_type(int(o.get("type_id") or 0))
+        _add_type_id(row.get("input_type_id"))
+        for o in row.get("outputs") or []:
+            _add_type_id(o.get("type_id"))
 
     type_info: Dict[str, Any] = {}
     for tid in sorted(used_type_ids):
-        meta = types.get(tid) or {}
-        type_info[str(tid)] = {
-            "name": meta.get("name", f"type {tid}"),
-            "volume": safe_float(meta.get("volume"), 0.0),
-        }
+        type_info[str(tid)] = {"name": tname(tid), "volume": tvol(tid)}
+
+
+# -----------------------------
+    # Write output
+    # -----------------------------
+    out_path = Path(args.out)
+    ensure_parent(out_path)
 
     payload = {
         "generated_at": utc_now_iso(),
         "type_info": type_info,
         "market": {
-            "region_id": region_id,
-            "station_id": station_id,
-            "buy_market": buy_market_key,
-            "sell_markets": sell_market_keys,
-            "markets": [market_by_key[k] for k in sorted(market_by_key.keys())],
-            "pricing_scope": pricing_scope,
+            "buy_market": {"key": buy_market.key, "name": buy_market.name, "kind": buy_market.kind},
+            "sell_markets": [{"key": m.key, "name": m.name, "kind": m.kind} for m in sell_markets],
             "price_mode": args.price_mode,
+            "pricing_scope": args.pricing_scope,
         },
+        "character": character or None,
         "assumptions": {
-            "modes": {
-                "instant": "buy inputs from sell orders; sell output to buy orders",
-                "patient": "place buy orders for inputs; list sell orders for output",
-            },
-            "taxes": {
+            "fees": {
                 "sales_tax": args.sales_tax,
                 "broker_fee": args.broker_fee,
-            },
-            "industry": {
-                "mfg_system_id": args.mfg_system_id,
-                "rx_system_id": args.rx_system_id,
-                "inv_system_id": args.inv_system_id,
-                "mfg_cost_index": mfg_cost_index,
-                "rx_cost_index": rx_cost_index,
-                "inv_cost_index": inv_cost_index,
                 "facility_tax": args.facility_tax,
                 "structure_job_bonus": args.structure_job_bonus,
             },
             "depth": {
                 "top_n": args.depth_top_n,
-                "max_materials": args.depth_max_materials,
                 "input_slippage": args.input_slippage,
                 "output_slippage": args.output_slippage,
-                "safety": args.depth_safety,
-                "note": "Depth uses ESI region orderbooks (structure markets may be undercounted).",
+                "depth_safety": args.depth_safety,
+                "max_materials": args.depth_max_materials,
             },
         },
         "manufacturing": manufacturing_rows,
@@ -2249,22 +2051,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "t2": t2_rows,
     }
 
-    out_path = Path(args.out)
-    ensure_parent(out_path)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-
-    # Write daily history snapshot (optional but awesome for trend charts)
-    hist_dir = Path("docs/data/history")
-    ensure_parent(hist_dir / "x")
-    hist_path = hist_dir / f"{utc_date_str()}.json"
-    try:
-        with open(hist_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-    except Exception:
-        pass
-
-    print(f"[update_rankings] Wrote {out_path} (and history snapshot)")
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"[update_rankings] Wrote {out_path} ({out_path.stat().st_size/1024:.1f} KiB)")
     return 0
 
 
