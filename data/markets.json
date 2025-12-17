@@ -1,81 +1,76 @@
 {
-  "buy_market": "jita",
-  "sell_markets": [
+  "default_buy": "jita",
+  "default_sells": [
     "jita",
     "amarr",
-    "hek",
     "dodixie",
     "rens",
-    "r-ag7w",
-    "e8-432",
-    "mj-5f9",
-    "r10-gn"
+    "hek"
   ],
-  "markets": [
-    {
-      "key": "jita",
-      "name": "Jita 4-4 (The Forge)",
+  "markets": {
+    "jita": {
+      "name": "Jita 4-4 (Caldari Navy Assembly Plant)",
       "kind": "station",
       "region_id": 10000002,
-      "station_id": 60003760
+      "station_id": 60003760,
+      "system_name": "Jita"
     },
-    {
-      "key": "amarr",
-      "name": "Amarr (Domain)",
+    "amarr": {
+      "name": "Amarr (Emperor Family Academy)",
       "kind": "station",
       "region_id": 10000043,
-      "station_id": 60008494
+      "station_id": 60008494,
+      "system_name": "Amarr"
     },
-    {
-      "key": "hek",
-      "name": "Hek (Metropolis)",
-      "kind": "station",
-      "region_id": 10000042,
-      "station_id": 60005686
-    },
-    {
-      "key": "dodixie",
-      "name": "Dodixie (Sinq Laison)",
+    "dodixie": {
+      "name": "Dodixie (Federation Navy Assembly Plant)",
       "kind": "station",
       "region_id": 10000032,
-      "station_id": 60011866
+      "station_id": 60011866,
+      "system_name": "Dodixie"
     },
-    {
-      "key": "rens",
-      "name": "Rens (Heimatar)",
+    "hek": {
+      "name": "Hek (Boundless Creation Factory)",
+      "kind": "station",
+      "region_id": 10000042,
+      "station_id": 60005686,
+      "system_name": "Hek"
+    },
+    "rens": {
+      "name": "Rens (Brutor Tribe Treasury)",
       "kind": "station",
       "region_id": 10000030,
-      "station_id": 60004588
+      "station_id": 60004588,
+      "system_name": "Rens"
     },
-    {
-      "key": "r-ag7w",
-      "name": "R-AG7W (structure market - requires structure_id + SSO)",
+    "r-ag7w": {
+      "name": "R-AG7W (structure market \u2014 set structure_id)",
       "kind": "structure",
-      "structure_id": null
+      "structure_id": 0,
+      "system_name": "R-AG7W"
     },
-    {
-      "key": "e8-432",
-      "name": "E8-432 (structure market - requires structure_id + SSO)",
+    "e8-432": {
+      "name": "E8-432 (structure market \u2014 set structure_id)",
       "kind": "structure",
-      "structure_id": null
+      "structure_id": 0,
+      "system_name": "E8-432"
     },
-    {
-      "key": "mj-5f9",
-      "name": "MJ-5F9 (structure market - requires structure_id + SSO)",
+    "mj-5f9": {
+      "name": "MJ-5F9 (structure market \u2014 set structure_id)",
       "kind": "structure",
-      "structure_id": null
+      "structure_id": 0,
+      "system_name": "MJ-5F9"
     },
-    {
-      "key": "r10-gn",
-      "name": "R10-GN (structure market - requires structure_id + SSO)",
+    "r10-gn": {
+      "name": "R10-GN (structure market \u2014 set structure_id)",
       "kind": "structure",
-      "structure_id": null
+      "structure_id": 0,
+      "system_name": "R10-GN"
+    },
+    "forge_region": {
+      "name": "The Forge (region-wide)",
+      "kind": "region",
+      "region_id": 10000002
     }
-  ],
-  "_notes": [
-    "Outputs are valued at the best sell market among sell_markets.",
-    "Inputs/materials are priced from buy_market.",
-    "NPC station markets use region aggregates (Fuzzwork) + ESI region orders for depth.",
-    "Null-sec hubs are usually player structures; to enable them you must fill structure_id and add authenticated structure-market fetching."
-  ]
+  }
 }
