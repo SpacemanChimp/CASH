@@ -53,7 +53,7 @@ jobs:
 
       - name: Build rankings (writes docs/data/rankings.json)
         run: |
-          python scripts/update_rankings.py \
+          python scripts/update_rankings.py --refresh
             --pricing-scope region \
             --price-mode percentile \
             --sales-tax 0.015 \
