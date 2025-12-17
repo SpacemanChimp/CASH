@@ -4,8 +4,14 @@ on:
   workflow_dispatch:
   push:
     branches: ["main"]
+    paths:
+      - "scripts/**"
+      - "docs/**"
+      - "data/**"
+      - ".github/workflows/**"
+      - "requirements.txt"
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *" # every 6 hours
 
 permissions:
   contents: read
@@ -23,26 +29,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: DEBUG - list workflow files and search for old flags
-        run: |
-          echo "== .github/workflows contents =="
-          ls -la .github/workflows || true
-          echo ""
-          echo "== Searching for deprecated flags in repo =="
-          grep -RIn             -e '--fee-rate'             -e '--reprocess-yield'             -e '--min-bpo-sell-orders'             -e '--limit-mfg'             -e '--limit-rx'             -e '--limit-ref'             .github/workflows scripts || true
-          echo ""
-          echo "If you see matches above, that file is still calling old CLI flags and must be updated/deleted."
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # Speeds up repeats by caching the fuzzwork eve.db + other downloads
       - name: Cache downloads
         uses: actions/cache@v4
         with:
           path: .cache
-          key: ${{ runner.os }}-eve-cache-v5
+          key: ${{ runner.os }}-eve-cache-v1
           restore-keys: |
             ${{ runner.os }}-eve-cache-
 
@@ -51,19 +48,41 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # OPTIONAL: if you are adding SSO later, keep these env vars.
+      # If you don't have these secrets yet, GitHub just passes empty values.
       - name: Build rankings (writes docs/data/rankings.json)
+        env:
+          EVE_SSO_CLIENT_ID: ${{ secrets.EVE_SSO_CLIENT_ID }}
+          EVE_SSO_REFRESH_TOKEN: ${{ secrets.EVE_SSO_REFRESH_TOKEN }}
+          EVE_SSO_CLIENT_SECRET: ${{ secrets.EVE_SSO_CLIENT_SECRET }}
         run: |
-          python scripts/update_rankings.py --refresh
+          python scripts/update_rankings.py \
             --pricing-scope region \
             --price-mode percentile \
             --sales-tax 0.015 \
             --broker-fee 0.0 \
-            --max-rows 250 \
+            --max-rows 300 \
             --min-blueprint-sell-orders 1 \
             --min-output-buy-orders 1 \
             --min-ref-input-sell-orders 1 \
             --min-ref-output-buy-orders 1 \
             --out docs/data/rankings.json
+
+          # If you have a multi-market config file and want arbitrage:
+          # python scripts/update_rankings.py \
+          #   --markets-config data/markets.json \
+          #   --buy-market jita \
+          #   --sell-markets jita,amarr,hek,dodixie,rens,r-ag7w,e8-432,mj-5f9,r10-gn,npc \
+          #   --pricing-scope region \
+          #   --price-mode percentile \
+          #   --sales-tax 0.015 \
+          #   --broker-fee 0.0 \
+          #   --max-rows 300 \
+          #   --min-blueprint-sell-orders 1 \
+          #   --min-output-buy-orders 1 \
+          #   --min-ref-input-sell-orders 1 \
+          #   --min-ref-output-buy-orders 1 \
+          #   --out docs/data/rankings.json
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
